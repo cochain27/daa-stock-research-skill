@@ -1,0 +1,28 @@
+# 个人数据 / 运行时生成 —— 绝不入库
+data/*
+!data/.gitkeep
+05_每日推送/*
+!05_每日推送/.gitkeep
+04_每日复盘/*
+!04_每日复盘/.gitkeep
+03_交易日记/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# 推送令牌
+push_config.json
+*.token
+
+# 系统
+.DS_Store
+Thumbs.db
+
+# 本地覆盖
+.env
+
+push_to_github.bat
+push_to_github.ps1

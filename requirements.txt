@@ -1,0 +1,7 @@
+# 核心依赖
+akshare>=1.14.0
+pandas>=2.0
+numpy>=1.24
+requests>=2.28
+
+# 可选（增强）：stock-researcher skill 提供价值投资交叉验证板块，缺失时自动降级
