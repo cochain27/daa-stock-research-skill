@@ -126,13 +126,23 @@ def _parse_pick_block(block_lines):
     m = re.match(r"###\s*(\d+)\.\s*(.+?)（(\d{6})）", first)
     if not m:
         return None
-    d["rank"], d["name"], d["code"] = m.group(1), m.group(2).strip(), m.group(3)
+    d["rank"], raw_name, d["code"] = m.group(1), m.group(2).strip(), m.group(3)
+    # 剥离策略标签（⚡短线 / 📈趋势 / 📈波段），避免卡片里显示脏名称
+    d["name"] = re.sub(r"\s*(⚡短线|📈趋势|📈波段)\s*[\d分/]*$", "", raw_name).strip()
     for ln in block_lines[1:]:
         ln = ln.strip().lstrip("- ").strip()
         if ln.startswith("现价："):
-            mm = re.search(r"现价：([\d.]+)\s*｜\s*当日涨跌：([\d.+-]+)%\s*｜\s*\*\*评分：([\d.]+)/100\*\*", ln)
-            if mm:
-                d["price"], d["chg"], d["score"] = mm.groups()
+            # 2026-09-04 修复：原三连严格正则因日报新增"行业｜🟡纯波段"字段而失配，
+            # 评分解析失败导致微信卡片不显示分数。改为独立正则分别解析价格/涨跌/评分。
+            m_price = re.search(r"现价：([\d.]+)", ln)
+            m_chg = re.search(r"当日涨跌：([\d.+-]+)%", ln)
+            m_score = re.search(r"\*\*评分：([\d.]+)/100\*\*", ln)
+            if m_price:
+                d["price"] = m_price.group(1)
+            if m_chg:
+                d["chg"] = m_chg.group(1)
+            if m_score:
+                d["score"] = m_score.group(1)
         elif ln.startswith("价值面："):
             d["dims"] = " / ".join(x.strip() for x in ln.split("｜"))
         elif ln.startswith("技术说明："):

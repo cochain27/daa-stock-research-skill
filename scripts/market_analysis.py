@@ -2,8 +2,8 @@
 """大盘环境分析：市场温度计 + 仓位建议"""
 import numpy as np
 import pandas as pd
-from fetch_data import get_index_daily, get_market_snapshot, get_stock_zt_pool, get_stock_dt_pool, get_market_fund_flow
-from config import WEIGHTS, TOTAL_CAPITAL
+from fetch_data import get_index_daily, get_market_snapshot, get_stock_zt_pool, get_stock_dt_pool, get_stock_zb_pool, get_market_fund_flow
+from config import WEIGHTS, TOTAL_CAPITAL, MARKET_ENV_THRESHOLDS, SHORTLINE_ZT_MIN, SHORTLINE_ZB_RATE_MAX
 
 
 def _ma(series, n):
@@ -256,3 +256,133 @@ def single_stock_position(score):
     if score >= 70:
         return TOTAL_CAPITAL * 0.20
     return 0
+
+
+def shortline_gate():
+    """短线通道情绪门槛（2026-09-05 双通道架构）
+    情绪达标 = 涨停家数≥SHORTLINE_ZT_MIN 且 炸板率<SHORTLINE_ZB_RATE_MAX
+    炸板率 = 炸板家数 / (涨停家数 + 炸板家数)
+    返回 (gate_open: bool, reason: str)
+    """
+    try:
+        zt_df = get_stock_zt_pool()
+        zb_df = get_stock_zb_pool()
+        zt_n = len(zt_df) if zt_df is not None else 0
+        zb_n = len(zb_df) if zb_df is not None else 0
+        total_attempts = zt_n + zb_n
+        zb_rate = (zb_n / total_attempts) if total_attempts > 0 else 1.0
+
+        reasons = []
+        gate = True
+        if zt_n < SHORTLINE_ZT_MIN:
+            gate = False
+            reasons.append(f"涨停{zt_n}家<{SHORTLINE_ZT_MIN}（情绪不够热）")
+        else:
+            reasons.append(f"涨停{zt_n}家")
+        if zb_rate >= SHORTLINE_ZB_RATE_MAX:
+            gate = False
+            reasons.append(f"炸板率{zb_rate*100:.0f}%≥{SHORTLINE_ZB_RATE_MAX*100:.0f}%（封板质量差，接力易被埋）")
+        else:
+            reasons.append(f"炸板率{zb_rate*100:.0f}%")
+
+        if gate:
+            return True, "情绪达标：" + "，".join(reasons)
+        return False, "短线通道休战：" + "，".join(reasons)
+    except Exception as e:
+        # 数据不可得时保守处理：不开闸
+        return False, f"短线通道休战：情绪数据不可得({e})"
+
+
+def judge_market_env(idx_df=None, temp=None, snapshot=None):
+    """判定市场环境，返回 (env_label, env_desc, reason)
+    env_label: "强势市" | "震荡市" | "弱势市"
+    env_desc:  简短描述
+    reason:    判定理由（供日报展示）
+    """
+    import akshare as ak
+
+    # 取指数数据（若未传入则自己拉）
+    if idx_df is None:
+        idx_df = get_index_daily("sh000001")
+    if idx_df is None or len(idx_df) < 60:
+        return "震荡市", "数据不足(中性)", "指数数据不足，无法判断，默认为震荡市"
+
+    close = idx_df["close"].astype(float)
+    ma20 = _ma(close, 20)
+    ma60 = _ma(close, 60)
+    last = close.iloc[-1]
+    m20 = ma20.iloc[-1]
+    m60 = ma60.iloc[-1]
+
+    # 取量能
+    vol_ok = False
+    amount = 0
+    if snapshot is not None and not snapshot.empty:
+        amount = snapshot["成交额"].sum() / 1e8
+    if amount < 100:
+        prev = _prev_day_amount()
+        if prev > 100:
+            amount = prev
+    if amount >= 100:
+        vol_ok = True
+
+    # 取温度（若未传入则算）
+    if temp is None:
+        temp, _ = calc_market_temperature()
+
+    # 取涨停池健康度（近5日连板率）
+    zt_df = get_stock_zt_pool()
+    zt_count = len(zt_df) if zt_df is not None else 0
+    zt_healthy = zt_count >= 30  # 涨停30家以上算情绪活跃
+
+    notes = []
+    env = "震荡市"
+    env_desc = "中性市况"
+
+    # 强势市条件：温度≥65 + MA多头排列 + 量能活跃
+    if temp >= MARKET_ENV_THRESHOLDS["strong_temp"]:
+        ma_ok = (last > m20 > m60) or (last > m20 and m20 > m60 * 0.98)
+        if ma_ok and vol_ok:
+            env = "强势市"
+            env_desc = "右侧行情"
+            notes.append(f"温度{temp:.0f}，MA多头，量能{amount:.0f}亿，涨停{zt_count}家")
+        elif ma_ok:
+            env = "强势市"
+            env_desc = "右侧行情（量能待确认）"
+            notes.append(f"温度{temp:.0f}，MA多头，涨停{zt_count}家")
+        else:
+            env = "震荡市"
+            env_desc = "温度偏高但趋势不强"
+            notes.append(f"温度{temp:.0f}，MA未多头，震荡市对待")
+
+    # 弱势市条件：温度≤35 或 指数跌破MA60 + 量能萎缩 + 涨停稀少
+    elif temp <= MARKET_ENV_THRESHOLDS["weak_temp"]:
+        if last < m60:
+            env = "弱势市"
+            env_desc = "控仓观望"
+            notes.append(f"温度{temp:.0f}，沪指破MA60，弱势")
+        elif not vol_ok or zt_count < 15:
+            env = "弱势市"
+            env_desc = "控仓观望"
+            notes.append(f"温度{temp:.0f}，量能萎缩/涨停稀少，弱势")
+        else:
+            env = "震荡市"
+            env_desc = "温度偏低但未破位"
+            notes.append(f"温度{temp:.0f}，未破位，震荡对待")
+
+    # 中间地带：震荡市（默认）
+    else:
+        if last > m20 > m60 and vol_ok and zt_healthy:
+            env = "震荡偏强"
+            env_desc = "局部做多"
+            notes.append(f"温度{temp:.0f}，MA多头但温度未达强势阈值")
+        elif last < m20 and m20 < m60:
+            env = "震荡偏弱"
+            env_desc = "谨慎做多"
+            notes.append(f"温度{temp:.0f}，MA空头排列")
+        else:
+            env = "震荡市"
+            env_desc = "中性市况"
+            notes.append(f"温度{temp:.0f}，趋势不明")
+
+    return env, env_desc, "; ".join(notes) if notes else f"温度{temp:.0f}"

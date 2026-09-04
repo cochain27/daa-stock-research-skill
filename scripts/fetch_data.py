@@ -406,3 +406,12 @@ def get_stock_dt_pool(date=None):
                       tries=2, name="跌停池")
     except Exception:
         return None
+
+
+def get_stock_zb_pool(date=None):
+    """炸板股池（东财：曾涨停后开板的票）——短线通道情绪判定用"""
+    try:
+        return _retry(lambda: ak.stock_zt_pool_zbgc_em(date=date or pd.Timestamp.now().strftime("%Y%m%d")),
+                      tries=2, name="炸板池")
+    except Exception:
+        return None

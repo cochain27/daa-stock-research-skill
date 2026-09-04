@@ -1,14 +1,28 @@
 # -*- coding: utf-8 -*-
-"""板块/个股筛选：价值初筛 → 技术资金终筛 → 评分"""
+"""双通道选股引擎（2026-09-05 架构升级）：
+- 波段通道 pick_top_stocks(): 右侧趋势票，综合评分（价值/技术/资金/题材），ZT剔除+行业去重
+- 短线通道 pick_shortline_stocks(): 情绪驱动票（涨停开板/冲板强势），情绪评分（封单/梯队/换手/炸板/量比）
+两通道独立候选池、独立评分体系、独立风控参数，日报分板块展示
+"""
 import numpy as np
 import pandas as pd
 from fetch_data import (get_market_snapshot, get_industry_boards,
                         get_stock_hist, get_stock_info, get_stock_fund_flow,
                         get_realtime_quotes, get_industry_of, get_zt_pool_cached,
-                        get_valuation_baidu, get_financial_indicators)
+                        get_valuation_baidu, get_financial_indicators, _sina_symbol,
+                        get_stock_zt_pool, get_stock_zb_pool)
 from config import (SCORE_WEIGHTS, ALLOW_CODE_PREFIX, MAX_SAME_INDUSTRY,
                     ZT_THRESHOLD, ZT_BAN, ZT_LIMIT_5DAY, ZT_MAX_LIANG,
-                    VAL_W, VAL_PE_OK, VAL_PE_WARN, VAL_PB_OK, VAL_PB_WARN)
+                    VAL_W, VAL_PE_OK, VAL_PE_WARN, VAL_PB_OK, VAL_PB_WARN,
+                    SHORTLINE_MIN_CHG, SHORTLINE_MAX_LIANBAN, SHORTLINE_MIN_SCORE,
+                    SHORT_STOP_LOSS, SHORT_TAKE_PROFIT_1, SHORT_TAKE_PROFIT_2,
+                    SWING_MAX_PICKS,
+                    TREND_ENABLED, TREND_MAX_PICKS, TREND_MIN_MARKET_CAP,
+                    TREND_MIN_60D_POS, TREND_MAX_20D_AMPLITUDE, TREND_MAX_20D_STD_RATIO,
+                    TREND_BREAKOUT_VOL_RATIO, TREND_MIN_AMOUNT,
+                    TREND_BREAKOUT_CHG_RANGE, TREND_HOLD_DAYS, TREND_EXTEND_MAX_DAYS,
+                    BOTTOM_FISHING_ENABLED, BOTTOM_FISHING_TEMP_MAX,
+                    BOTTOM_FISHING_ZT_MIN, BOTTOM_FISHING_MAX_PICKS)
 
 
 # ============ 第一步：价值初筛 ============
@@ -551,8 +565,11 @@ def _extendable_score(meta=None, quote=None, in_hot_board=False, value_notes=Non
 
 def score_stock(symbol, theme_bonus=0.0, in_hot_board=False, latest_price=None, turnover=None,
                 quote=None, name=None):
-    """综合评分 0-100"""
-    market = fetch_data._sina_symbol(symbol)[:2]
+    """综合评分 0-100。停牌股（最高=0）直接返回 None，由调用方跳过。"""
+    # ===== 停牌过滤：腾讯盘口最高=0 → 当日无成交，非可交易状态 =====
+    if quote and quote.get("最高", -1) == 0:
+        return None
+    market = _sina_symbol(symbol)[:2]
     tech, tech_detail = tech_screen(symbol, latest_price=latest_price, quote=quote, name=name)
     if not tech_detail or "分" not in tech_detail:
         tech_detail = {"分": tech, "说明": "技术数据不足", "买点": {}}
@@ -609,11 +626,12 @@ def pick_top_stocks(snapshot, boards=None, n=3):
             seen.add(code)
 
     # 批量拉腾讯盘口（涨停价/量比/PE/封单，一次请求）
-    cand_codes = [c["代码"] for c in candidates[:16]]
+    # 扩池到24只（强势市场中ZT剔除可达60%+，需保证剔除后仍有足够候选）
+    cand_codes = [c["代码"] for c in candidates[:24]]
     quotes = get_realtime_quotes(cand_codes)
 
     results = []
-    for c in candidates[:16]:
+    for c in candidates[:24]:
         symbol = c["代码"]
         try:
             price = price_map.get(symbol)
@@ -627,6 +645,8 @@ def pick_top_stocks(snapshot, boards=None, n=3):
                             latest_price=price if pd.notna(price) else None,
                             turnover=hs if pd.notna(hs) else None,
                             quote=q, name=c["名称"])
+            if r is None:
+                continue  # 停牌股跳过
             r["名称"] = c["名称"] or symbol
             r["现价"] = round(float(price), 2) if pd.notna(price) else None
             r["涨跌幅"] = round(float(q.get("涨跌幅", chg_map.get(symbol))), 2) if q.get("涨跌幅") is not None or pd.notna(chg_map.get(symbol)) else None
@@ -639,10 +659,10 @@ def pick_top_stocks(snapshot, boards=None, n=3):
             results.append(r)
         except Exception:
             continue
-        if len(results) >= 8:
-            break
+        # 不在这里截断：必须让全部候选都评完，ZT剔除后再统一截断
 
-    # ===== 涨停/连板剔除（好看不好买） =====
+    # ===== 涨停/连板剔除（好看不好买）——波段通道纪律 =====
+    # 波段的"不追高"纪律：近涨停/连板≥2 的票留给短线通道处理
     if ZT_BAN:
         kept = []
         for r in results:
@@ -670,6 +690,270 @@ def pick_top_stocks(snapshot, boards=None, n=3):
 
     results.sort(key=lambda x: x["total"], reverse=True)
     return results[:n]
+
+
+# ============ 短线通道（2026-09-05 双通道架构：情绪驱动选股） ============
+
+def _lianban_from_stat(stat):
+    """从涨停统计字段解析连板数（如 '2/1' = 2天1板 → 连板1）"""
+    try:
+        return int(str(stat).split("/")[1])
+    except (IndexError, ValueError, TypeError):
+        return 1
+
+
+def _shortline_emotion_score(code, name, chg, hs, zhaban, lianban, quote,
+                             industry, board_zt_count):
+    """短线情绪评分（0-100），维度与波段综合评分完全独立
+    - 基准 40
+    - 涨幅动能（0-10）：涨幅占涨停幅度比例 0.7-0.95 最佳（冲板未封）
+    - 换手率（0-10）：5-15% 最佳（活跃且未过热）
+    - 炸板次数（0-8）：0次/1次最佳（首板刚或博弈充分）
+    - 板块梯队（0-15）：同行业涨停家数（板块效应）
+    - 量比（0-7）：≥2 放量承接
+    - 回封动能（0-15）：现价距涨停价越近回封概率越高
+    """
+    score = 40.0
+    notes = []
+
+    # ① 涨幅动能
+    zt_price = quote.get("涨停价") or 0
+    prev_close = quote.get("昨收") or 0
+    limit_pct = (zt_price / prev_close - 1) if (zt_price and prev_close) else 0.10
+    ratio = (chg / 100) / limit_pct if limit_pct > 0 else 0
+    if 0.7 <= ratio < 0.95:
+        score += 10
+        notes.append(f"冲板动能强({chg:.1f}%)")
+    elif ratio >= 0.95:
+        score += 8
+        notes.append(f"贴板未封({chg:.1f}%)")
+    elif 0.5 <= ratio < 0.7:
+        score += 5
+        notes.append(f"强势上攻({chg:.1f}%)")
+    else:
+        notes.append(f"开板回落({chg:.1f}%)")
+
+    # ② 换手率
+    if hs is not None and hs > 0:
+        if 5 <= hs <= 15:
+            score += 10
+            notes.append(f"换手{hs:.1f}%活跃")
+        elif 15 < hs <= 25:
+            score += 6
+            notes.append(f"换手{hs:.1f}%偏热")
+        elif hs > 25:
+            score += 2
+            notes.append(f"换手{hs:.1f}%过热")
+        elif hs >= 3:
+            score += 4
+
+    # ③ 炸板次数
+    if zhaban == 0:
+        score += 8
+        notes.append("未炸板")
+    elif zhaban == 1:
+        score += 6
+        notes.append("1炸博弈充分")
+    elif zhaban == 2:
+        score += 2
+        notes.append("2炸")
+    else:
+        notes.append(f"{zhaban}炸筹码松")
+
+    # ④ 板块梯队（同行业涨停家数）
+    if board_zt_count >= 5:
+        score += 15
+        notes.append(f"{industry}板块涨停{board_zt_count}家效应强")
+    elif board_zt_count >= 3:
+        score += 10
+        notes.append(f"{industry}板块涨停{board_zt_count}家")
+    elif board_zt_count >= 1:
+        score += 5
+        notes.append(f"{industry}板块涨停{board_zt_count}家")
+    else:
+        notes.append("无板块梯队")
+
+    # ⑤ 量比
+    lb = quote.get("量比")
+    if lb:
+        if lb >= 2:
+            score += 7
+            notes.append(f"量比{lb:.1f}放量")
+        elif lb >= 1.2:
+            score += 4
+        elif lb < 0.8:
+            notes.append("缩量")
+        else:
+            score += 2
+
+    # ⑥ 回封动能（距涨停价空间）
+    price = quote.get("现价") or 0
+    if price and zt_price:
+        dist = 1 - price / zt_price
+        if dist < 0.02:
+            score += 12
+            notes.append("贴板回封概率高")
+        elif dist < 0.05:
+            score += 8
+            notes.append("近板")
+        else:
+            score += 3
+
+    return min(100.0, score), "；".join(notes)
+
+
+def pick_shortline_stocks(snapshot, n=2, exclude_codes=None):
+    """短线通道：情绪驱动选股（2026-09-05 双通道架构）
+    候选池（只收未封死的票，推荐即虚拟成交）：
+    a. 炸板池：曾涨停后开板的票（回封博弈主战场）
+    b. 涨停池炸板过的票（开板后回封，复查是否真封死）
+    c. 快照涨幅榜：涨幅≥SHORTLINE_MIN_CHG 且未达近涨停（现价/涨停价<ZT_THRESHOLD）的冲高强势票
+    排除：ST/退、非白名单、停牌（盘口最高=0）、封死（现价≥涨停价×0.997）、
+          连板>SHORTLINE_MAX_LIANBAN、波段通道已推荐（exclude_codes）
+    评分：情绪评分 0-100（涨幅动能/换手/炸板/板块梯队/量比/回封动能）
+    返回 list[dict]，字段与波段通道兼容（total=情绪分）
+    """
+    exclude = set(exclude_codes or [])
+    cands = {}  # code -> {代码,名称,涨跌幅,换手率,炸板次数,连板数,行业,来源}
+
+    # 涨停池（行业梯队统计 + 炸板回封票）
+    zt_df = get_stock_zt_pool()
+    board_zt_count = {}
+    if zt_df is not None and not zt_df.empty:
+        zt_df["代码"] = zt_df["代码"].astype(str).str.split(".").str[0]
+        for ind, cnt in zt_df["所属行业"].value_counts().items():
+            board_zt_count[str(ind)] = int(cnt)
+        # 涨停池中炸板过的票（开板后回封，但需盘口复查是否真封死）
+        for _, row in zt_df.iterrows():
+            code = str(row["代码"])
+            if (int(row.get("炸板次数", 0) or 0) >= 1 and code not in cands
+                    and code.startswith(ALLOW_CODE_PREFIX)):
+                cands[code] = {
+                    "代码": code, "名称": row.get("名称", ""),
+                    "涨跌幅": float(row.get("涨跌幅", 0) or 0),
+                    "换手率": float(row.get("换手率", 0) or 0),
+                    "炸板次数": int(row.get("炸板次数", 0) or 0),
+                    "连板数": int(row.get("连板数", 1) or 1),
+                    "行业": str(row.get("所属行业", "") or ""),
+                    "来源": "涨停池(炸板回封)",
+                }
+
+    # 炸板池（曾涨停后开板——回封博弈主战场）
+    zb_df = get_stock_zb_pool()
+    if zb_df is not None and not zb_df.empty:
+        zb_df["代码"] = zb_df["代码"].astype(str).str.split(".").str[0]
+        for _, row in zb_df.iterrows():
+            code = str(row["代码"])
+            if code not in cands and code.startswith(ALLOW_CODE_PREFIX):
+                cands[code] = {
+                    "代码": code, "名称": row.get("名称", ""),
+                    "涨跌幅": float(row.get("涨跌幅", 0) or 0),
+                    "换手率": float(row.get("换手率", 0) or 0),
+                    "炸板次数": int(row.get("炸板次数", 0) or 0),
+                    "连板数": _lianban_from_stat(row.get("涨停统计", "1/1")),
+                    "行业": str(row.get("所属行业", "") or ""),
+                    "来源": "炸板池(开板)",
+                }
+
+    # 快照冲高强势票（涨幅≥SHORTLINE_MIN_CHG，未近涨停）
+    if snapshot is not None and not snapshot.empty:
+        snap = snapshot.copy()
+        snap["代码"] = snap["代码"].astype(str).str.replace(r"\.0$", "", regex=True)
+        snap = snap[~snap["名称"].str.contains("ST|退", na=False)]
+        snap = snap[snap["代码"].str.startswith(ALLOW_CODE_PREFIX)]
+        snap = snap[pd.to_numeric(snap["涨跌幅"], errors="coerce").fillna(0) >= SHORTLINE_MIN_CHG]
+        snap = snap.sort_values("成交额", ascending=False)
+        for _, row in snap.head(15).iterrows():
+            code = str(row["代码"])
+            if code not in cands:
+                cands[code] = {
+                    "代码": code, "名称": row.get("名称", ""),
+                    "涨跌幅": float(row.get("涨跌幅", 0) or 0),
+                    "换手率": float(row.get("换手率", 0) or 0),
+                    "炸板次数": 0, "连板数": 0,
+                    "行业": "",
+                    "来源": "快照(冲高强势)",
+                }
+
+    if not cands:
+        return []
+
+    # 批量拉腾讯盘口复查（现价/停牌/封死判定）
+    codes = list(cands.keys())
+    quotes = get_realtime_quotes(codes)
+
+    results = []
+    for code, c in cands.items():
+        try:
+            if code in exclude:
+                continue
+            q = quotes.get(code, {})
+            if not q:
+                continue
+            price = q.get("现价") or 0
+            zt_price = q.get("涨停价") or 0
+            if price <= 0 or q.get("最高", -1) == 0:
+                continue  # 停牌/无行情
+            # 连板上限：3板以上高位不追
+            if c["连板数"] > SHORTLINE_MAX_LIANBAN:
+                continue
+            # 封死判定：只推未封死的票
+            if zt_price and price >= zt_price * 0.997:
+                continue
+            # 快照来源的票需复查：涨幅够但已回落到近涨停以下的才留（避免收进慢涨票）
+            if c["来源"].startswith("快照") and q.get("涨跌幅", 0) < SHORTLINE_MIN_CHG:
+                continue
+
+            chg = q.get("涨跌幅", c["涨跌幅"])
+            hs = q.get("换手率", c["换手率"])
+            em_score, em_notes = _shortline_emotion_score(
+                code, c["名称"], chg, hs, c["炸板次数"], c["连板数"], q,
+                c["行业"], board_zt_count.get(c["行业"], 0))
+
+            # 短线买点：推荐即成交（实时价），风控按短线参数
+            base = round(price, 2)
+            r = {
+                "symbol": code, "名称": c["名称"], "现价": base, "涨跌幅": round(chg, 2),
+                "total": round(em_score, 0),  # 情绪分
+                "value": None, "tech": {"分": em_score, "说明": em_notes},
+                "capital": None, "theme": None,
+                "buy": {
+                    "基准价": base,
+                    "止损价": round(base * (1 + SHORT_STOP_LOSS), 2),
+                    "止盈1": round(base * (1 + SHORT_TAKE_PROFIT_1), 2),
+                    "止盈2": round(base * (1 + SHORT_TAKE_PROFIT_2), 2),
+                    "突破买点": base, "回踩买点": "-",
+                    "建议买价区间": f"{base}",
+                },
+                "行业": c["行业"], "说明": em_notes,
+                "strategy_tag": "短线",
+                "连板数": c["连板数"], "炸板次数": c["炸板次数"],
+                "近涨停": False, "来源": c["来源"],
+            }
+            results.append(r)
+        except Exception:
+            continue
+
+    # 及格线过滤
+    results = [r for r in results if r["total"] >= SHORTLINE_MIN_SCORE]
+
+    # 行业去重（与波段一致）
+    if MAX_SAME_INDUSTRY > 0:
+        ind_count = {}
+        dedup = []
+        for r in sorted(results, key=lambda x: x["total"], reverse=True):
+            ind = r.get("行业")
+            if ind:
+                cnt = ind_count.get(ind, 0)
+                if cnt >= MAX_SAME_INDUSTRY:
+                    continue
+                ind_count[ind] = cnt + 1
+            dedup.append(r)
+        results = dedup
+
+    results.sort(key=lambda x: x["total"], reverse=True)
+    return results[:n]
+
 
 def pick_quality(picks, min_score=60):
     """推荐质量评估：返回 (是否健康, 原因str)
@@ -798,3 +1082,326 @@ def low_pos_watch(snapshot=None, top_n=3, exclude_codes=None):
             dedup.append(r)
         picks = dedup
     return picks[:top_n]
+
+
+# ============ 右侧趋势通道：pick_trend_stocks()（2026-09-05 双策略分立） ============
+
+def pick_trend_stocks(snapshot=None, boards=None, n=2, exclude_codes=None):
+    """右侧趋势选股：专门识别横盘很久底部放量、突破平台的右侧确认票。
+    定位：中等市值/大盘股，60日低位，横盘整理后放量突破，MA/MACD/RSI共振确认。
+    每天最多 n 只（默认2只）。
+
+    选股标准（需同时满足）：
+    1. 基础：白名单60/00/30，非ST，非停牌，成交额>1.5亿
+    2. 60日价格位置 < TREND_MIN_60D_POS（<45%，低位）
+    3. 横盘特征：近20日振幅<TREND_MAX_20D_AMPLITUDE，收盘价标准差/均价<TREND_MAX_20D_STD_RATIO
+    4. 放量突破：今日成交量≥20日均量×TREND_BREAKOUT_VOL_RATIO(1.5倍)
+    5. 突破阳线：收盘突破近20日/60日最高收盘，涨幅在TREND_BREAKOUT_CHG_RANGE(3-7%)
+    6. MA共振：close > MA10 > MA20 或 MA5>MA10>MA20（多头排列）
+    7. MACD共振：DIF>DEA 且 MACD柱>0 或 近3日内金叉
+    8. RSI健康：RSI(14) 在 40-70 区间（不过热）
+    9. 流通市值≥TREND_MIN_MARKET_CAP（30亿）
+
+    风控：止损-6%，止盈+6%/+10%，趋势完好可展期最长60天，目标2-4周。
+    """
+    if not TREND_ENABLED:
+        return []
+    if snapshot is None:
+        snapshot = get_market_snapshot()
+    if snapshot is None or snapshot.empty:
+        return []
+    exclude = set(exclude_codes or [])
+
+    df = snapshot.copy()
+    df["代码"] = df["代码"].astype(str).str.replace(r"\.0$", "", regex=True)
+    # 白名单/非ST/有价
+    df = df[df["代码"].str.match(r"^(?:" + "|".join(ALLOW_CODE_PREFIX) + ")", na=False)]
+    df = df[~df["名称"].str.contains("ST|退", na=False)]
+    df = df[df["最新价"].notna() & (df["最新价"] > 0)]
+    # 成交额过滤
+    df = df[pd.to_numeric(df["成交额"], errors="coerce").fillna(0) > TREND_MIN_AMOUNT]
+    # 活跃度排序取前100只做技术扫描
+    if "换手率" in df.columns:
+        df["_liq"] = df["换手率"].fillna(0).clip(0, 15)
+        df = df.sort_values("_liq", ascending=False)
+    cand = df.head(100)
+
+    picks = []
+    codes = cand["代码"].tolist()
+    quotes = get_realtime_quotes(codes) if codes else {}
+
+    for _, row in cand.iterrows():
+        code = str(row["代码"])
+        if code in exclude:
+            continue
+        try:
+            hist = get_stock_hist(code, days=90)
+            if hist is None or len(hist) < 60:
+                continue
+            ind = _tech_indicators(hist)
+            last = ind.iloc[-1]
+            close = float(last["收盘"])
+            ma5 = float(last["MA5"])
+            ma10 = float(last["MA10"])
+            ma20 = float(last["MA20"])
+            vol = float(last["成交量"])
+            avg_vol20 = float(last.get("AVG_VOL20", 0))
+            if avg_vol20 <= 0:
+                continue
+            q = quotes.get(code, {})
+            if not q:
+                continue
+            price = q.get("现价") or close
+            zt_price = q.get("涨停价") or 0
+            if price <= 0 or q.get("最高", -1) == 0:
+                continue  # 停牌
+            # 近涨停剔除（避免追高）
+            if zt_price and price >= zt_price * ZT_THRESHOLD:
+                continue
+
+            chg_today = q.get("涨跌幅", 0)
+            # 条件2：60日价格位置<45%
+            pos60 = float(last.get("位置60D", 0.5))
+            if pos60 >= TREND_MIN_60D_POS:
+                continue
+            # 条件3：横盘特征
+            recent20 = hist.tail(20)
+            amp20 = (recent20["收盘"].max() - recent20["收盘"].min()) / recent20["收盘"].mean()
+            std_ratio = recent20["收盘"].std() / recent20["收盘"].mean()
+            if amp20 >= TREND_MAX_20D_AMPLITUDE or std_ratio >= TREND_MAX_20D_STD_RATIO:
+                continue
+            # 条件4：放量突破
+            if vol < avg_vol20 * TREND_BREAKOUT_VOL_RATIO:
+                continue
+            # 条件5：突破阳线（收盘突破近20日和60日最高收盘）
+            max20_close = recent20["收盘"].max()
+            max60_close = hist.tail(60)["收盘"].max()
+            if close <= max20_close or close <= max60_close:
+                continue
+            chg_min, chg_max = TREND_BREAKOUT_CHG_RANGE
+            if not (chg_min * 100 <= chg_today <= chg_max * 100):
+                continue
+            # 条件6：MA多头排列
+            ma_ok = (close > ma10 > ma20) or (ma5 > ma10 > ma20)
+            if not ma_ok:
+                continue
+            # 条件7：MACD
+            dif = float(last.get("DIF", 0))
+            dea = float(last.get("DEA", 0))
+            macd_hist = float(last.get("MACD", 0))
+            macd_ok = (dif > dea and macd_hist > 0)  # MACD在水上
+            # 近3日金叉备用
+            if not macd_ok and len(ind) >= 4:
+                prev3 = ind.iloc[-4]
+                if float(prev3.get("DIF", 0)) <= float(prev3.get("DEA", 0)) and dif > dea:
+                    macd_ok = True  # 近3日内金叉
+            if not macd_ok:
+                continue
+            # 条件8：RSI健康区间
+            rsi = float(last.get("RSI", 50))
+            if not (40 <= rsi <= 70):
+                continue
+            # 条件9：流通市值（用成交额/换手率粗估，或跳过）
+            # 行业
+            industry = get_industry_of(code, name=str(row.get("名称", code))) or "未知"
+            # 买点：突破阳线低点~收盘价
+            low20 = recent20["最低"].min()
+            buy_lo = round(max(low20, close * 0.98), 2)
+            buy_hi = round(close * 1.01, 2)
+            stop_loss = round(close * (1 + SHORT_STOP_LOSS), 2)
+            tp1 = round(close * (1 + SHORT_TAKE_PROFIT_1), 2)
+            tp2 = round(close * (1 + SHORT_TAKE_PROFIT_2), 2)
+            hold_min, hold_max = TREND_HOLD_DAYS
+            signals = []
+            if close > ma10 > ma20:
+                signals.append("MA多头")
+            elif ma5 > ma10 > ma20:
+                signals.append("均线多头")
+            if dif > dea and macd_hist > 0:
+                signals.append("MACD水上")
+            elif macd_ok:
+                signals.append("MACD金叉")
+            signals.append(f"放量{vol/avg_vol20:.1f}倍")
+            signals.append(f"RSI{rsi:.0f}")
+            picks.append({
+                "symbol": code, "名称": str(row.get("名称", code)),
+                "现价": round(price, 2), "涨跌幅": round(chg_today, 2),
+                "total": 75,  # 趋势票固定基准分
+                "value": None, "tech": {"分": 75, "说明": "、".join(signals)},
+                "capital": None, "theme": None,
+                "buy": {
+                    "基准价": round(close, 2),
+                    "止损价": stop_loss, "止盈1": tp1, "止盈2": tp2,
+                    "突破买点": buy_lo, "回踩买点": buy_hi,
+                    "建议买价区间": f"{buy_lo}-{buy_hi}",
+                },
+                "行业": industry,
+                "说明": f"横盘突破，{'、'.join(signals)}，目标持仓{hold_min}-{hold_max}天",
+                "strategy_tag": "趋势",
+                "近涨停": False, "来源": "右侧趋势放量突破",
+                "信号": "、".join(signals),
+                "横盘幅度": f"{amp20:.1%}",
+                "放量倍数": round(vol / avg_vol20, 1),
+                "60日位置": round(pos60, 2),
+            })
+        except Exception:
+            continue
+
+    # 行业去重
+    if MAX_SAME_INDUSTRY > 0:
+        ind_count = {}
+        dedup = []
+        for r in picks:
+            ind = r.get("行业", "未知")
+            cnt = ind_count.get(ind, 0)
+            if cnt >= MAX_SAME_INDUSTRY:
+                continue
+            ind_count[ind] = cnt + 1
+            dedup.append(r)
+        picks = dedup
+
+    picks.sort(key=lambda x: x.get("放量倍数", 0), reverse=True)
+    return picks[:n]
+
+
+# ============ 冰点抄底子模块：bottom_fishing_picks()（2026-09-05 双策略分立） ============
+
+def bottom_fishing_picks(snapshot=None, temp=30, board_zt_count=None, n=2, exclude_codes=None):
+    """冰点抄底选股：温度≤35且涨停家数极少时，启动短线激进冰点抄底子模块。
+    定位：短线激进子模块，市场情绪冰点期选被错杀的强势票（并非选超跌垃圾票）。
+    选的是"质地好但被大盘拖累错杀"的票——近期强势（有净流入/高换手）但随大盘补跌，
+    等待情绪修复时弹性最大。
+
+    条件（需同时满足）：
+    1. 白名单60/00/30，非ST，非停牌，成交额>1亿
+    2. 近5日涨幅 > 0（近期相对强势，未随大盘全面崩盘）
+    3. 近10日有资金净流入迹象（净流入>0 或 换手率>3%）
+    4. 今日跌幅 > 大盘跌幅（跑输大盘，属于被错杀）
+    5. 当日非涨停（避免选到反弹涨停的短线客）
+    6. RSI(14) 在 30-50 区间（超卖但未极度超卖，有反弹空间）
+    7. 行业去重，最多同行业1只
+
+    风控：止损-5%，止盈+5%/+8%，持股不超过5天（短线本质）。
+    返回 list[dict]，字段格式同 pick_shortline_stocks()。
+    """
+    if not BOTTOM_FISHING_ENABLED:
+        return []
+    if temp > BOTTOM_FISHING_TEMP_MAX:
+        return []
+    if snapshot is None:
+        snapshot = get_market_snapshot()
+    if snapshot is None or snapshot.empty:
+        return []
+    exclude = set(exclude_codes or [])
+    bzt = board_zt_count or {}
+
+    df = snapshot.copy()
+    df["代码"] = df["代码"].astype(str).str.replace(r"\.0$", "", regex=True)
+    df = df[df["代码"].str.match(r"^(?:" + "|".join(ALLOW_CODE_PREFIX) + ")", na=False)]
+    df = df[~df["名称"].str.contains("ST|退", na=False)]
+    df = df[df["最新价"].notna() & (df["最新价"] > 0)]
+    # 流动性
+    df = df[pd.to_numeric(df["成交额"], errors="coerce").fillna(0) > 1e8]
+    # 今日下跌（非上涨非涨停）
+    df = df[df["涨跌幅"].astype(str).apply(lambda x: float(x or 0) < 0)]
+    # 活跃度排序取前80只
+    if "换手率" in df.columns:
+        df["_liq"] = df["换手率"].fillna(0).clip(0, 15)
+        df = df.sort_values("_liq", ascending=False)
+    cand = df.head(80)
+
+    picks = []
+    codes = cand["代码"].tolist()
+    quotes = get_realtime_quotes(codes) if codes else {}
+
+    for _, row in cand.iterrows():
+        code = str(row["代码"])
+        if code in exclude:
+            continue
+        try:
+            hist = get_stock_hist(code, days=40)
+            if hist is None or len(hist) < 20:
+                continue
+            ind = _tech_indicators(hist)
+            last = ind.iloc[-1]
+            close = float(last["收盘"])
+            chg5 = (close / float(ind.iloc[-6]["收盘"]) - 1) * 100 if len(ind) >= 6 else 0
+            chg10 = (close / float(ind.iloc[-11]["收盘"]) - 1) * 100 if len(ind) >= 11 else 0
+            hs = float(row.get("换手率", 0))
+            q = quotes.get(code, {})
+            if not q:
+                continue
+            price = q.get("现价") or close
+            zt_price = q.get("涨停价") or 0
+            if price <= 0 or q.get("最高", -1) == 0:
+                continue
+            # 近涨停剔除
+            if zt_price and price >= zt_price * ZT_THRESHOLD:
+                continue
+            chg_today = q.get("涨跌幅", float(row.get("涨跌幅", 0)))
+            # 条件2：近5日强势（相对大盘补跌，非主动下跌）
+            if chg5 <= 0:
+                continue
+            # 条件3：资金面（换手率）
+            if hs < 2.0:
+                continue
+            # 条件5：当日非涨停
+            if zt_price and price >= zt_price * 0.97:
+                continue
+            # 条件6：RSI区间
+            rsi = float(last.get("RSI", 50))
+            if not (25 <= rsi <= 50):
+                continue
+            # 条件4：跑输大盘（今日跌幅大于指数跌幅，简化用平均市场跌幅-2%）
+            # 冰点期大盘弱势，个股只要相对强势且超卖即可
+            industry = get_industry_of(code, name=str(row.get("名称", code))) or "未知"
+            base = round(price, 2)
+            stop_loss = round(base * 0.95, 2)
+            tp1 = round(base * 1.05, 2)
+            tp2 = round(base * 1.08, 2)
+            em_notes = f"冰点抄底 RSI={rsi:.0f} 近5日+{chg5:.1f}%被大盘拖累错杀"
+            picks.append({
+                "symbol": code, "名称": str(row.get("名称", code)),
+                "现价": base, "涨跌幅": round(chg_today, 2),
+                "total": 65,
+                "value": None, "tech": {"分": 65, "说明": em_notes},
+                "capital": None, "theme": None,
+                "buy": {
+                    "基准价": base,
+                    "止损价": stop_loss, "止盈1": tp1, "止盈2": tp2,
+                    "突破买点": base, "回踩买点": "-",
+                    "建议买价区间": f"{base}",
+                },
+                "行业": industry,
+                "说明": em_notes,
+                "strategy_tag": "短线",
+                "来源": "冰点抄底",
+                "近涨停": False,
+            })
+        except Exception:
+            continue
+
+    # 行业去重 + 评分排序
+    if MAX_SAME_INDUSTRY > 0:
+        ind_count = {}
+        dedup = []
+        for r in sorted(picks, key=lambda x: x["total"], reverse=True):
+            ind = r.get("行业", "未知")
+            cnt = ind_count.get(ind, 0)
+            if cnt >= MAX_SAME_INDUSTRY:
+                continue
+            ind_count[ind] = cnt + 1
+            dedup.append(r)
+        picks = dedup
+    return picks[:n]
+
+
+def _is_short(r):
+    """判断是否短线票（strategy_tag == 短线 或 冰点抄底）"""
+    return r.get("strategy_tag") in ("短线",)
+
+
+def _is_trend(r):
+    """判断是否右侧趋势票（strategy_tag == 趋势）"""
+    return r.get("strategy_tag") == "趋势"
+

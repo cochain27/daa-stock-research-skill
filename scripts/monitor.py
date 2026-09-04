@@ -40,14 +40,24 @@ def run_monitor():
     # 合并代码：今日推荐优先用 today_picks 的 buy 数据；台账补充历史跟踪股
     track_map = {}
     for p in picks:
-        track_map[str(p["symbol"])] = {"名称": p.get("名称", p["symbol"]), "buy": p.get("buy", {}), "展期": False}
+        track_map[str(p["symbol"])] = {
+            "名称": p.get("名称", p["symbol"]),
+            "buy": p.get("buy", {}),
+            "策略标签": p.get("strategy_tag", "波段"),
+            "展期": False,
+        }
     for r in open_picks:
         code = r["代码"]
         if code not in track_map:
-            track_map[code] = {"名称": r["名称"], "buy": {
-                "止损价": r.get("止损"), "止盈1": r.get("止盈1"), "止盈2": r.get("止盈2"),
-                "建议买价区间": r.get("买区"), "基准价": r.get("基准价"),
-            }, "展期": r.get("状态") == "展期中" or ("展期" in (r.get("备注") or ""))}
+            track_map[code] = {
+                "名称": r["名称"],
+                "buy": {
+                    "止损价": r.get("止损"), "止盈1": r.get("止盈1"), "止盈2": r.get("止盈2"),
+                    "建议买价区间": r.get("买区"), "基准价": r.get("基准价"),
+                },
+                "策略标签": r.get("策略标签", "波段"),
+                "展期": r.get("状态") == "展期中" or ("展期" in (r.get("备注") or "")),
+            }
 
     codes = list(track_map.keys())
     quotes = get_realtime_quotes(list(set(codes)))
@@ -80,20 +90,29 @@ def run_monitor():
         tp2 = _f(b.get("止盈2"))
         breakout = _f(b.get("突破买点"))
 
-        # 已展期票：止盈档位升级为 +10%/+15%（基于基准价重算，覆盖台账原始 +6%/+10%）
+        # 已展期票：止盈档位升级为 +10%/+15%（基于基准价重算）
+        # 短线票：覆盖为短线参数（台账可能存的是波段档位）
+        from config import (EXTEND_TP1, EXTEND_TP2,
+                            SHORT_STOP_LOSS, SHORT_TAKE_PROFIT_1, SHORT_TAKE_PROFIT_2)
         extended = info.get("展期", False)
-        if extended and base and base > 0:
-            tp1 = round(base * 1.10, 2)
-            tp2 = round(base * 1.15, 2)
+        tag = info.get("策略标签", "波段")
+        if tag == "短线" and base and base > 0:
+            stop = round(base * (1 + SHORT_STOP_LOSS), 2)
+            tp1 = round(base * (1 + SHORT_TAKE_PROFIT_1), 2)
+            tp2 = round(base * (1 + SHORT_TAKE_PROFIT_2), 2)
+        elif extended and base and base > 0:
+            tp1 = round(base * (1 + EXTEND_TP1), 2)
+            tp2 = round(base * (1 + EXTEND_TP2), 2)
 
+        tag_icon = "⚡短线" if tag == "短线" else ("🟢展期" if extended else "📈波段")
         if stop and price <= stop:
-            checks.append(("止损", f"⛔ 跟踪池 {name}({code}) 现价{price} 跌破止损{stop}，移除跟踪"))
+            checks.append(("止损", f"⛔ 跟踪池 {name}({code}) {tag_icon} 现价{price} 跌破止损{stop}，移除跟踪"))
         if tp2 and price >= tp2:
-            pct = "+15%" if extended else "+10%"
-            checks.append(("止盈2", f"💰 跟踪池 {name}({code}) 现价{price} 达止盈2 {tp2}（{pct}），清仓移除"))
+            pct = "+15%" if extended else ("+8%" if tag == "短线" else "+10%")
+            checks.append(("止盈2", f"💰 跟踪池 {name}({code}) {tag_icon} 现价{price} 达止盈2 {tp2}（{pct}），清仓移除"))
         if tp1 and price >= tp1:
-            pct = "+10%" if extended else "+6%"
-            checks.append(("止盈1", f"💰 跟踪池 {name}({code}) 现价{price} 达止盈1 {tp1}（{pct}），建议减半"))
+            pct = "+10%" if extended else ("+5%" if tag == "短线" else "+6%")
+            checks.append(("止盈1", f"💰 跟踪池 {name}({code}) {tag_icon} 现价{price} 达止盈1 {tp1}（{pct}），建议减半"))
 
         lo, hi = None, None
         rng = str(b.get("建议买价区间", ""))

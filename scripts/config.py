@@ -3,10 +3,8 @@
 import os
 from pathlib import Path
 
-# ============ 路径（可移植：环境变量优先，默认按 skill 包内相对定位） ============
-# 本机生产环境用 DAA_PROJECT_ROOT 指向 E:\workbuddy——大A 覆盖；
-# 默认按脚本位置定位：scripts/config.py -> parent.parent = skill 包根目录
-PROJECT_ROOT = Path(os.environ.get("DAA_PROJECT_ROOT", Path(__file__).resolve().parent.parent))
+# ============ 路径 ============
+PROJECT_ROOT = Path(r"E:\workbuddy——大A")
 DATA_DIR = PROJECT_ROOT / "data"
 PUSH_DIR = PROJECT_ROOT / "05_每日推送"
 REVIEW_DIR = PROJECT_ROOT / "04_每日复盘"
@@ -16,9 +14,36 @@ for _d in [DATA_DIR, PUSH_DIR, REVIEW_DIR]:
 
 # ============ 风格参数（用户设定） ============
 TOTAL_CAPITAL = 100_000      # 总资金 10万以下（按10万估）
-RISK_STYLE = "短线波段"       # 持仓7-10天（目标波段），2026-09-03 调整为推荐池跟踪模式
+RISK_STYLE = "双策略并行"       # 2026-09-05 起：短线激进 + 右侧趋势 分通道独立运作
 MAX_POSITION_PER_STOCK = 0.30  # 单票最大仓位 30%
-DAILY_PICKS = 2              # 每日推荐只数上限（实际按质量1-2只灵活输出）
+
+# ============ 虚拟盘参数（2026-09-05 小火炉拍板：推荐即虚拟成交，实时价入账） ============
+VIRTUAL_ENABLED = True                   # 虚拟盘开关
+VIRTUAL_BASE = 100_000                   # 虚拟净值基准 10万
+VIRTUAL_TRADE_AMOUNT = 10_000            # 每笔虚拟成交金额（等权记账，不受仓位约束）
+VIRTUAL_BUY_PRICE_MODE = "realtime"      # 虚拟建仓价：推荐时实时价（推荐=成交）
+VIRTUAL_BUY_ZONE_CHECK = False           # 已废弃：不再校验次日触及买区（历史保留字段）
+VIRTUAL_BUY_ZONE_DAYS = 2                # 已废弃（历史保留字段）
+
+# ============ 双通道选股（2026-09-05 小火炉拍板：短线激进 + 右侧波段分通道） ============
+# 短线通道（情绪驱动：涨停梯队/冲板票，推荐即虚拟成交）
+SHORTLINE_ENABLED = True            # 短线通道总开关
+SHORTLINE_ZT_MIN = 50               # 情绪门槛：涨停家数≥50 才开闸
+SHORTLINE_ZB_RATE_MAX = 0.40        # 情绪门槛：炸板率<40%（炸板/(涨停+炸板)）
+SHORTLINE_MAX_PICKS = 2             # 短线通道每日最多 2 只
+SHORTLINE_MIN_SCORE = 60            # 短线情绪评分及格线（低于不出票）
+SHORTLINE_MIN_CHG = 5.0             # 短线候选最低涨幅%（冲板/强势票）
+SHORTLINE_MAX_LIANBAN = 2           # 短线候选连板数上限（≤2，3板以上高位不追）
+# 波段通道（右侧趋势：现有综合评分体系）
+SWING_MAX_PICKS = 2                 # 波段通道每日最多 2 只
+DAILY_PICKS = 4                     # 双通道合计上限（短线0-2 + 波段0-2）
+
+# ============ 短线策略参数（弱势市/短线票专用） ============
+SHORT_STOP_LOSS = -0.04            # 短线止损 -4%（比波段-6%更紧）
+SHORT_TAKE_PROFIT_1 = 0.05         # 短线止盈1 +5%（减半）
+SHORT_TAKE_PROFIT_2 = 0.08         # 短线止盈2 +8%（清仓）
+SHORT_HOLD_DAYS_MAX = 5            # 短线目标3-5天，极限5天
+SHORT_TP_MOVE_UP = 0.02            # 短线盈利>2%上移止损至成本线
 
 # 候选股代码前缀白名单：主板(60/00) + 创业板(30)
 # 科创板(68)无交易权限，北交所(92/43/83)排除 —— 2026-09-01 小火炉反馈
@@ -37,10 +62,19 @@ HOLD_DAYS_QUIT = 5           # 横盘 5 天强制离场
 EXTEND_MAX_DAYS = 30         # 展期硬上限 30 天（超 1 个月强制离场，2026-09-03 确认）
 EXTEND_MAX_COUNT = 2         # 同时展期票 ≤2 只（少数，非常态）
 EXTEND_TP1 = 0.10            # 展期后第一档止盈 +10%（减半仓，基于成本价）
-EXTEND_TP2 = 0.15            # 展期后第二档止盈 +15%（清仓，基于成本价）—— 到了就走，不追趋势顶
+EXTEND_TP2 = 0.15            # 展期后第二档止盈 +15%（清仓，基于成本价）
+EXTEND_PEAK_DRAWBACK = 0.12 # 展期后从峰值最大回撤超此值也触发离场
 
 # ============ 市场温度权重 ============
 WEIGHTS = {"trend": 30, "sentiment": 30, "volume": 20, "capital": 20}
+
+# ============ 市场环境判定阈值（2026-09-03 用于策略打标） ============
+# 环境由 market_analysis.judge_market_env() 根据温度计+指数MA排列+量能综合判定
+MARKET_ENV_THRESHOLDS = {
+    "strong_temp": 65,       # 温度≥65 + MA多头 → 强势市（右侧波段为主）
+    "weak_temp": 35,         # 温度≤35 → 弱势市（短线/空仓观望）
+    "bull_run_ma": "above",  # 强势市要求：收盘>MA20>MA60
+}
 
 # ============ 数据源 ============
 DATA_SOURCE = "akshare"      # 备用: mx-stocks-screener / tushare
@@ -79,4 +113,32 @@ TECH_USE_60D_POS = True       # 60日价格位置
 TECH_USE_UPPER_SHADOW = True  # 长上影/冲高回落
 TECH_USE_ZT = True            # 当日涨停/近涨停判定
 TECH_USE_QUANTITY = True      # 量比（腾讯盘口）
+
+# ============ 右侧趋势通道参数（2026-09-05 双策略分立） ============
+TREND_ENABLED = True               # 右侧趋势通道总开关
+TREND_MAX_PICKS = 2                # 右侧趋势每日最多 2 只
+TREND_MIN_MARKET_CAP = 30_0000_000  # 流通市值≥30亿（避免流动性风险）
+TREND_MIN_60D_POS = 0.45          # 60日价格位置 <45%（低位才考虑）
+TREND_MAX_20D_AMPLITUDE = 0.25    # 近20日振幅 <25%（横盘）
+TREND_MAX_20D_STD_RATIO = 0.05    # 近20日收盘价标准差/均价 <5%（横盘紧凑）
+TREND_BREAKOUT_VOL_RATIO = 1.5    # 放量突破：成交量 ≥ 20日均量 × 此倍数
+TREND_MIN_AMOUNT = 1.5_0000_000   # 成交额 >1.5亿
+TREND_BREAKOUT_CHG_RANGE = (0.03, 0.07)  # 突破涨幅区间 3%-7%
+TREND_HOLD_DAYS = (14, 28)        # 目标持仓 2-4 周
+TREND_EXTEND_MAX_DAYS = 60        # 展期硬上限 60 天（1-2 个月）
+TREND_EXTEND_MAX_COUNT = 2         # 同时展期票 ≤2 只
+
+# ============ 冰点抄底子模块（2026-09-05 双策略分立） ============
+BOTTOM_FISHING_ENABLED = True             # 冰点抄底总开关
+BOTTOM_FISHING_TEMP_MAX = 35              # 温度≤35 才启用
+BOTTOM_FISHING_ZT_MIN = 30                # 冰点时涨停家数参考下限（极低迷参考）
+BOTTOM_FISHING_MAX_PICKS = 2              # 冰点抄底每日最多 2 只
+
+# ============ 短线激进回测台账（2026-09-05 双策略分立） ============
+SHORT_BACKTEST_PATH = DATA_DIR / "短线回测台账.csv"
+SHORT_BACKTEST_AMOUNT = 10_000            # 短线回测每笔虚拟金额
+
+# ============ 双策略台账路径（2026-09-05 双策略分立） ============
+TRACK_SHORT_PATH = DATA_DIR / "推荐台账_短线激进.csv"   # 短线激进台账
+TRACK_TREND_PATH = DATA_DIR / "推荐台账_右侧趋势.csv"   # 右侧趋势台账
 
