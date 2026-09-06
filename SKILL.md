@@ -60,6 +60,11 @@ pip install -r requirements.txt
 # 建议：pip install akshare pandas numpy requests
 ```
 
+> **macOS 本机环境（2026-09 迁移后）**：项目自带 venv，直接用绝对路径运行，勿用系统 python：
+> `/Users/chenyuting/Documents/workbuddy/workbuddy-daa/daa-stock-research-skill/.venv/bin/python`
+> 若需重建 venv，注意 `jsonpath==0.82.2` 的 sdist 会触发 pip 的 EEXIST 解压 bug，
+> 需手动下载解包后 `pip install ./jsonpath-0.82.2`，再装其余依赖。
+
 ### 2. 配置（可选）
 
 - **数据目录**：首次运行自动在包根创建 `data/`、`05_每日推送/`、`04_每日复盘/`
@@ -68,7 +73,7 @@ pip install -r requirements.txt
   ```json
   {"pushplus_token": "你的pushplus令牌"}
   ```
-- **价值投资交叉验证**（可选增强）：安装 stock-researcher skill 后自动启用；未安装时该板块自动降级为空。可用 `DAA_SKILL_DIR` 指定其路径。
+- **板块RPS / 个股评分**：由 `scripts/skill_bridge.py` 内置实现，无需外部 skill
 
 ### 3. 运行
 
@@ -80,14 +85,24 @@ python scripts/close_review.py    # 收盘复盘（双策略，15:10 后）
 python scripts/monitor.py         # 盘中监控（配合定时任务每15分钟）
 ```
 
-> 本机生产环境示例：`DAA_PROJECT_ROOT=E:\workbuddy——大A python scripts/daily_report.py`
+> 本机生产环境示例（macOS）：
+> `cd /Users/chenyuting/Documents/workbuddy/workbuddy-daa/daa-stock-research-skill/scripts && /Users/chenyuting/Documents/workbuddy/workbuddy-daa/daa-stock-research-skill/.venv/bin/python daily_report.py`
 
-### 4. 定时化建议（工作日）
+### 4. 定时化（工作日）
 
-- 09:25 `daily_report.py`（晨报推送）
-- 11:35 `noon_review.py`
-- 15:10 `close_review.py`
-- 盘中 09:35-15:00 每15分钟 `monitor.py`
+macOS 本机已用 WorkBuddy 自动化托管（无需 cron / 计划任务）：
+
+| 时间 | 自动化 | 脚本 |
+|------|--------|------|
+| 09:25 | A股晨报 | `daily_report.py` |
+| 10:35 | A股盘中监控(上午) | `monitor.py` |
+| 11:35 | A股午间复盘 | `noon_review.py` |
+| 14:45 | A股盘中监控(尾盘) | `monitor.py` |
+| 15:10 | A股收盘复盘 | `close_review.py` |
+| 21:30 | 代码自动推送 GitHub | `上传到GitHub.sh` |
+
+- 非交易日（休市/无数据）自动化自动静默跳过，不产生噪音
+- 代码仓库：https://github.com/cochain27/daa-stock-research-skill
 
 ## 风控参数速查
 
