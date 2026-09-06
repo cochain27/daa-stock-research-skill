@@ -73,7 +73,25 @@ pip install -r requirements.txt
   ```json
   {"pushplus_token": "你的pushplus令牌"}
   ```
-- **板块RPS / 个股评分**：由 `scripts/skill_bridge.py` 内置实现，无需外部 skill
+- **研究层增强（依赖外部 skill `stock-researcher`）**：通过 `scripts/skill_bridge.py` 桥接，缺失时**全部静默降级为 None**（日报照跑，但研究板块变空）：
+  | 桥接函数 | 提供能力 |
+  |---|---|
+  | `get_sector_rps()` | 板块 RPS 相对强度排名（20d/60d/趋势） |
+  | `get_market_regime()` | 市场体制判定（牛/熊/震荡 + 置信度） |
+  | `get_stock_score(code)` | 个股预测评分 + 信号 |
+  | `get_value_decision(code)` | 价值投资交叉验证 6 模块（护城河/财务健康/DCF/管理层/行业/因子）→ 公允价值区间 + 安全边际 |
+
+  安装方式（本机已装）：
+  ```bash
+  # SkillHub slug: aistockresearcher
+  cp -R <下载解压目录>/. ~/.workbuddy/skills/aistockresearcher__skillhub/
+  ```
+  目录名必须为 `aistockresearcher__skillhub`（桥接层硬编码查找），或设 `DAA_SKILL_DIR` 覆盖。
+
+  > ⚠️ **已知偏差（2026-09-07 实测）**：`get_value_decision` 的**相对分可用、绝对值不可信**。
+  > 例：600519 现价 1330 元，返回公允价值区间 [602.81, 665.37, 731.91]，DCF 模块仅得 10/100，
+  > margin 输出 -99.9（异常）。原因待查（疑为财务数据陈旧或复权/股本口径问题）。
+  > **使用纪律：只看 moat / financial_health / factor 等分项排序做交叉验证，禁止直接引用 fair_value 与 margin 下单。**
 
 ### 3. 运行
 

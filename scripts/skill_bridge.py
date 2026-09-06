@@ -40,8 +40,9 @@ def _run_cli(args, timeout=120):
     if not _skill_available():
         return None
     try:
+        # 用当前解释器（项目 venv）而非裸 "python"，否则子进程缺 pandas/akshare 会静默降级
         r = subprocess.run(
-            ["python", str(CLI)] + args,
+            [sys.executable, str(CLI)] + args,
             cwd=str(SKILL_DIR), capture_output=True, text=True,
             encoding="utf-8", errors="replace", timeout=timeout,
         )
