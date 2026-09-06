@@ -381,6 +381,23 @@ def run_daily():
     brief = generate_brief(temp, pos_advice, boards, picks, track_rows, track_overview,
                            market_env=market_env)
 
+    # 风险日历排雷（2026-09-07 新增）：只提示不自动剔除，交由人工决策
+    try:
+        from risk_calendar import check as _rc_check, render_md as _rc_render
+        _codes = [p.get("symbol") for p in picks if p.get("symbol")]
+        _rows = _rc_check(_codes)
+        if _rows:
+            _name_of = {str(p.get("symbol")): p.get("名称", "") for p in picks}
+            for r in _rows:
+                r["name"] = _name_of.get(r["code"], "")
+            full = full + _rc_render(_rows)
+            _hi = [r for r in _rows if r["level"] == "高"]
+            brief = brief + f"\n⚠️ 排雷：{len(_rows)} 只触发" + (
+                f"（高危 {len(_hi)} 只：" + "、".join(
+                    f"{r['name'] or r['code']}" for r in _hi) + "）" if _hi else "")
+    except Exception as _e:
+        print(f"[排雷] 跳过（{_e}）")
+
     today = datetime.now().strftime("%Y-%m-%d")
     path = PUSH_DIR / f"推送_{today}.md"
     path.write_text(full, encoding="utf-8")

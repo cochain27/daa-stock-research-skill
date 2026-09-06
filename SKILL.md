@@ -106,7 +106,24 @@ python scripts/monitor.py         # 盘中监控（配合定时任务每15分钟
 > 本机生产环境示例（macOS）：
 > `cd /Users/chenyuting/Documents/workbuddy/workbuddy-daa/daa-stock-research-skill/scripts && /Users/chenyuting/Documents/workbuddy/workbuddy-daa/daa-stock-research-skill/.venv/bin/python daily_report.py`
 
-### 4. 定时化（工作日）
+### 4. 风险日历排雷（2026-09-07 新增）
+
+`scripts/risk_calendar.py` —— 拦截两类可预知的坑，晨报自动调用：
+
+| 风险类型 | 判定 | 等级 |
+|---|---|---|
+| 未来 10 天内披露财报 | 巨潮预约披露日落在窗口内 | 中 |
+| 已发负面业绩预告 | 预告类型 ∈ 预减/首亏/续亏/增亏/略减/转亏/减亏 | 高 |
+
+- 数据源：akshare 免费接口，全市场数据**每日仅拉一次**并缓存到 `data/risk_calendar_cache.json`
+- **只提示、不自动剔除**：等级「高」建议人工剔除或等披露后再看
+- 任何失败静默降级（打印 `[排雷] 跳过`），绝不阻断日报
+- 手动检查：`python scripts/risk_calendar.py 600519 000001`
+- TODO：个股级解禁（接口需按日遍历，成本高，暂未接入）
+
+> 已知限制：财报空窗期（如 9 月初，半年报已披露完、三季报预约未出）"待披露"项会为空，属正常。
+
+### 5. 定时化（工作日）
 
 macOS 本机已用 WorkBuddy 自动化托管（无需 cron / 计划任务）：
 

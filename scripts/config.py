@@ -4,7 +4,8 @@ import os
 from pathlib import Path
 
 # ============ 路径 ============
-PROJECT_ROOT = Path(r"E:\workbuddy——大A")
+# 默认取「本文件上级目录」= skill 包根，跨机器免改；可用环境变量 DAA_PROJECT_ROOT 覆盖
+PROJECT_ROOT = Path(os.environ.get("DAA_PROJECT_ROOT") or Path(__file__).resolve().parent.parent)
 DATA_DIR = PROJECT_ROOT / "data"
 PUSH_DIR = PROJECT_ROOT / "05_每日推送"
 REVIEW_DIR = PROJECT_ROOT / "04_每日复盘"
