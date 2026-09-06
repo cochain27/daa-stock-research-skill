@@ -31,3 +31,6 @@ push_to_github.ps1
 
 # 一次性迁移脚本（含本机绝对路径，仅本机使用，不发布）
 migrate_ledger.py
+
+# macOS 本地上传脚本
+上传到GitHub.sh
