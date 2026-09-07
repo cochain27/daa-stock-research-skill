@@ -327,7 +327,7 @@ def push_wechat(title, content, channel=None, html=False):
 
 def push_report(title, md_text, max_len=3500):
     """推送日报类长文：转手机端紧凑HTML（超长截断，完整版看E盘文件）"""
-    body = md_text if len(md_text) <= max_len else md_text[:max_len] + "\n\n> …（完整版见E盘推送文件）"
+    body = md_text if len(md_text) <= max_len else md_text[:max_len] + "\n\n> …（超长已截断，完整版见本地推送文件）"
     return push_wechat(title, md_to_mobile_html(body), html=True)
 
 

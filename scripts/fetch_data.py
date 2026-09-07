@@ -5,10 +5,47 @@
 """
 import os
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")  # 保护 akshare 百度源 numpy 线程
+import socket
 import time
 import akshare as ak
 import pandas as pd
 import requests
+
+# 全局 socket 超时：akshare/requests 多数调用未设 timeout，
+# 遇不可达源会永久阻塞在 SSL_read（2026-09-07 午间复盘挂死 30min+）。
+# 设为 30s 后超时会抛异常，交给 _retry 降级或快速失败，不再无限等待。
+socket.setdefaulttimeout(60)
+
+# requests 在 timeout=None 时会显式 settimeout(None) 覆盖全局默认值，
+# 必须在 Session 层强制注入默认超时，否则依然无限阻塞。
+# 30s 不够：新浪全A快照 70 页经本机代理平均 3.7s/页，偶发单页 >30s（2026-09-07 收盘复盘失败）。
+_HTTP_TIMEOUT = 60
+
+# 东财数字子域（82.push2 / 1.push2 …）会随机不可达（2026-09-07 收盘复盘因此失败），
+# 主域 push2.eastmoney.com 始终可用：超时后自动降级到主域重试一次。
+import re as _re
+_EM_NUM_HOST = _re.compile(r"^(https?://)\d+\.push2\.eastmoney\.com")
+
+if not getattr(requests.Session, "_daa_timeout_patched", False):
+    _orig_session_request = requests.Session.request
+
+    def _session_request(self, *args, **kwargs):
+        kwargs.setdefault("timeout", _HTTP_TIMEOUT)
+        try:
+            return _orig_session_request(self, *args, **kwargs)
+        except Exception:
+            url = args[1] if len(args) > 1 else kwargs.get("url", "")
+            if not (isinstance(url, str) and _EM_NUM_HOST.match(url)):
+                raise
+            alt = _EM_NUM_HOST.sub(r"\1push2.eastmoney.com", url)
+            if len(args) > 1:
+                args = (args[0], alt) + tuple(args[2:])
+            else:
+                kwargs["url"] = alt
+            return _orig_session_request(self, *args, **kwargs)
+
+    requests.Session.request = _session_request
+    requests.Session._daa_timeout_patched = True
 
 
 def _retry(fn, tries=3, delay=2.0, name=""):
