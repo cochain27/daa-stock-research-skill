@@ -26,11 +26,21 @@ _HTTP_TIMEOUT = 60
 import re as _re
 _EM_NUM_HOST = _re.compile(r"^(https?://)\d+\.push2\.eastmoney\.com")
 
+# 强制直连开关：默认关代理。
+# 原因：macOS 系统代理开启时 urllib/requests(trust_env=True) 会自动读取，
+# 全局代理模式下出口 IP 落在境外，东财/新浪按境外 IP 限流或封禁
+# （2026-09-08 收盘复盘东财 clist 持续 502）。国内行情源一律直连。
+# 确需走代理时：export DAA_USE_PROXY=1
+_USE_PROXY = os.environ.get("DAA_USE_PROXY", "").strip().lower() in ("1", "true", "yes")
+
 if not getattr(requests.Session, "_daa_timeout_patched", False):
     _orig_session_request = requests.Session.request
 
     def _session_request(self, *args, **kwargs):
         kwargs.setdefault("timeout", _HTTP_TIMEOUT)
+        if not _USE_PROXY:
+            self.trust_env = False
+            kwargs["proxies"] = kwargs.get("proxies") or {"http": None, "https": None}
         try:
             return _orig_session_request(self, *args, **kwargs)
         except Exception:

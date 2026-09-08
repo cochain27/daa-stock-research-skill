@@ -32,8 +32,9 @@ def run_monitor():
 
     # 加载台账中未结清的推荐股（今日推荐 + 历史仍在跟踪池）
     try:
-        from tracker import load_open_picks
-        open_picks = load_open_picks()
+        from trend_tracker import load_open_picks as _trend_open
+        from short_tracker import load_open_picks as _short_open
+        open_picks = _trend_open() + _short_open()
     except Exception:
         open_picks = []
 

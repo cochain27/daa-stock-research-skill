@@ -16,6 +16,32 @@ from config import REVIEW_DIR, PUSH_DIR, VIRTUAL_ENABLED
 BASE = Path(__file__).resolve().parent.parent
 
 
+WATCH_FIELDS = ["日期", "代码", "名称", "现价", "60日位置", "信号", "5日涨幅",
+                "行业", "买点区间", "止损价", "关注逻辑"]
+
+
+def _archive_watch(watch, today):
+    """低位启动观察池落盘留痕。
+
+    复盘 md 只有一份（次日重跑即覆盖），且 04_每日复盘/ 被 .gitignore 排除，
+    历史观察池无处可查 —— 这里按日期累加进 data/watch_history.csv，同日重跑去重。
+    """
+    import csv
+    path = BASE / "data" / "watch_history.csv"
+    rows = []
+    if path.exists():
+        with path.open(encoding="utf-8") as f:
+            rows = [r for r in csv.DictReader(f) if r.get("日期") != today]
+    for w in watch:
+        rows.append({"日期": today, **{k: w.get(k, "") for k in WATCH_FIELDS[1:]}})
+    rows.sort(key=lambda r: (r.get("日期", ""), r.get("代码", "")))
+    with path.open("w", newline="", encoding="utf-8") as f:
+        wr = csv.DictWriter(f, fieldnames=WATCH_FIELDS)
+        wr.writeheader()
+        wr.writerows(rows)
+    return path
+
+
 def _nav_line(nav):
     if not nav:
         return ""
@@ -188,6 +214,10 @@ def run_close():
         watch = low_pos_watch(top_n=3, exclude_codes=track_codes)
         lines.append("## 本周低位启动观察（趋势侧跟踪池补充）\n")
         if watch:
+            try:
+                _archive_watch(watch, today)
+            except Exception as e:
+                print(f"[低位观察] 归档失败 {e}")
             lines.append("| 股票 | 现价 | 60日位置 | 启动信号 | 5日涨幅 | 买点区间 | 止损 |")
             lines.append("|------|------|----------|----------|---------|----------|------|")
             for w in watch:

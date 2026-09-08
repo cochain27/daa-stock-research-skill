@@ -107,6 +107,17 @@ python scripts/monitor.py         # 盘中监控（配合定时任务每15分钟
 > 本机生产环境示例（macOS）：
 > `cd /Users/chenyuting/Documents/workbuddy/workbuddy-daa/daa-stock-research-skill/scripts && /Users/chenyuting/Documents/workbuddy/workbuddy-daa/daa-stock-research-skill/.venv/bin/python daily_report.py`
 
+> ⚠️ **必须走包装器，不要直跑 `daily_report.py`**（2026-09-07/08 两次验证）：
+> akshare 大量接口无超时，链路抖动时会**永久挂起**（直跑实测无输出卡死，整套流程 ~13 分钟）。
+> 固化包装器：`scripts/_run_daily_wrapper.py`（requests 25s 超时 + 浏览器 UA + 退避重试 + 全A快照并发分页 + faulthandler 看门狗）。
+> 用法：`cd scripts && <.venv>/bin/python _run_daily_wrapper.py`
+> 已知坑：
+> ① **必须绕过系统代理**（2026-09-08 修正，旧结论「必须走系统代理」是错的）：macOS 开系统代理时 `urllib`/`requests(trust_env=True)` 会自动继承，全局代理模式（trojan 等）下出口 IP 在境外，东财按境外 IP 限流/封禁 → `clist` 接口持续 502。`fetch_data.py` 已内置强制直连（`trust_env=False` + `proxies=None`），需走代理时 `export DAA_USE_PROXY=1`。
+> ② 东财拒 `python-requests` 默认 UA，高频后会封 IP，封了切新浪；
+> ③ 包装器里 snapshot 缓存补丁会报 `No module named 'fetch_data'`（无害，快照会被拉两次）。
+>
+> 排查口诀：**行情接口报 502/超时，先查系统代理是否开着**（`scutil --proxy`），再怀疑 UA/限流。
+
 ### 4. 风险日历排雷（2026-09-07 新增）
 
 `scripts/risk_calendar.py` —— 拦截两类可预知的坑，晨报自动调用：
