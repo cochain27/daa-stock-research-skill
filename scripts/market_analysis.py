@@ -3,7 +3,8 @@
 import numpy as np
 import pandas as pd
 from fetch_data import get_index_daily, get_market_snapshot, get_stock_zt_pool, get_stock_dt_pool, get_stock_zb_pool, get_market_fund_flow
-from config import WEIGHTS, TOTAL_CAPITAL, MARKET_ENV_THRESHOLDS, SHORTLINE_ZT_MIN, SHORTLINE_ZB_RATE_MAX
+from config import (WEIGHTS, TOTAL_CAPITAL, MARKET_ENV_THRESHOLDS, SHORTLINE_ZT_MIN,
+                    SHORTLINE_ZB_RATE_MAX, SHORTLINE_TEMP_MIN, TREND_TEMP_MIN)
 
 
 def _ma(series, n):
@@ -285,12 +286,31 @@ def shortline_gate():
         else:
             reasons.append(f"炸板率{zb_rate*100:.0f}%")
 
+        # 温度门控（2026-09-09：回测8个月4个月为负，低温期不开仓）
+        temp, _ = calc_market_temperature()
+        if temp < SHORTLINE_TEMP_MIN:
+            gate = False
+            reasons.append(f"温度{temp:.0f}<{SHORTLINE_TEMP_MIN}（弱势期短线期望为负）")
+        else:
+            reasons.append(f"温度{temp:.0f}")
+
         if gate:
             return True, "情绪达标：" + "，".join(reasons)
         return False, "短线通道休战：" + "，".join(reasons)
     except Exception as e:
         # 数据不可得时保守处理：不开闸
         return False, f"短线通道休战：情绪数据不可得({e})"
+
+
+def trend_gate():
+    """趋势通道温度门控（2026-09-09：回测2月/9月低温期月度收益为负，温度≥55 才开仓）"""
+    try:
+        temp, _ = calc_market_temperature()
+        if temp >= TREND_TEMP_MIN:
+            return True, f"温度{temp:.0f}≥{TREND_TEMP_MIN}"
+        return False, f"温度{temp:.0f}<{TREND_TEMP_MIN}（低温期趋势期望为负）"
+    except Exception as e:
+        return False, f"趋势通道休战：温度数据不可得({e})"
 
 
 def judge_market_env(idx_df=None, temp=None, snapshot=None):

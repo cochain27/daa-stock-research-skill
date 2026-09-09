@@ -15,7 +15,7 @@ from fetch_data import get_realtime_quotes, get_stock_hist
 from config import (
     TRACK_SHORT_PATH, SHORT_BACKTEST_PATH,
     SHORT_STOP_LOSS, SHORT_TAKE_PROFIT_1, SHORT_TAKE_PROFIT_2,
-    SHORT_HOLD_DAYS_MAX, VIRTUAL_ENABLED, ALLOW_CODE_PREFIX,
+    SHORT_HOLD_DAYS_MAX, SHORT_TIME_STOP_DAYS, VIRTUAL_ENABLED, ALLOW_CODE_PREFIX,
 )
 from tracker_common import (
     _read_rows, _write_rows, _vtrade_read, _vtrade_write,
@@ -238,23 +238,23 @@ def update_track():
             r["状态"] = "止损出局"
             r["备注"] = f"触发{int(abs(SHORT_SL)*100)}%止损(峰值{hi:+.1f}%)"
             record_settlement(r, vtrade, price, "止损出局")
-        # 技术面破坏
+        # 技术面破坏（含移动止盈：盈利>3%跌破MA10清仓）
         elif tech_broken:
             r["状态"] = "技术离场"
             r["备注"] = f"技术面破坏:{tech_reason}(收益{ret:+.1f}%)"
             record_settlement(r, vtrade, price, "技术面破坏离场")
-        # 止盈2
-        elif price >= tp2_target:
-            r["状态"] = "止盈2清仓"
-            r["备注"] = f"达+{SHORT_TP2*100:.0f}%目标(峰值{hi:+.1f}%)"
-            record_settlement(r, vtrade, price, "止盈2清仓")
-        # 止盈1
+        # 止盈1（减半后剩余仓位走移动止损，不再 +8% 一次性清仓——2026-09-09 改造）
         elif price >= tp1_target:
             if r["状态"] != "止盈1减半":
                 r["状态"] = "止盈1减半"
-                r["备注"] = f"达+{SHORT_TP1*100:.0f}%减半仓"
+                r["备注"] = f"达+{SHORT_TP1*100:.0f}%减半仓，剩余仓位移动止损(MA10)"
             else:
                 r["备注"] = f"减半后持有中(峰值{hi:+.1f}%)"
+        # 时间止损（2026-09-09：持有≥3天仍浮亏，等待成本高于快刀）
+        elif SHORT_TIME_STOP_DAYS > 0 and days >= SHORT_TIME_STOP_DAYS and ret < 0:
+            r["状态"] = "时间止损"
+            r["备注"] = f"满{SHORT_TIME_STOP_DAYS}天仍浮亏{ret:+.1f}%，时间止损"
+            record_settlement(r, vtrade, price, "时间止损")
         # 3天硬上限（短线持股不超过1周，按回测逻辑3天了结）
         elif days >= SHORT_MAX:
             r["状态"] = "到期离场"
@@ -388,14 +388,14 @@ def stats():
                 "回测笔数": 0, "回测胜率": "-", "回测平均盈亏": "-"}
 
     closed = [r for r in rows if r["状态"] in
-              ("止盈2清仓", "止盈1清仓", "止盈清仓", "止损出局", "技术离场", "到期离场")]
+              ("止盈2清仓", "止盈1清仓", "止盈清仓", "止损出局", "技术离场", "到期离场", "时间止损")]
 
     def _wr(records):
         if not records:
             return "-"
         win = [r for r in records if r["状态"] in ("止盈2清仓", "止盈1清仓", "止盈清仓") or
-               (r["状态"] == "到期离场" and "+" in r.get("备注", "").split("收益")[-1]) or
-               (r["状态"] == "技术离场" and "+" in r.get("备注", "").split("收益")[-1])]
+               (r["状态"] in ("到期离场", "技术离场", "时间止损") and
+                "+" in r.get("备注", "").split("收益")[-1])]
         return f"{len(win)/len(records)*100:.0f}%"
 
     hi_list = [float(r["最高收益%"] or 0) for r in rows if r["最高收益%"]]

@@ -32,8 +32,8 @@ import json
 import pandas as pd
 import requests
 
-from fetch_data import get_market_snapshot  # 仅需其超时 patch + 快照
-from stock_screener import _tech_indicators, get_industry_of, ALLOW_CODE_PREFIX, MAX_SAME_INDUSTRY
+from fetch_data import get_market_snapshot, _industry_by_name  # 超时 patch + 快照 + 本地行业兜底
+from stock_screener import _tech_indicators, ALLOW_CODE_PREFIX, MAX_SAME_INDUSTRY
 from close_review import _archive_watch
 
 CAND_TOP = 1200        # 候选池大小（按当前成交额排序）
@@ -152,11 +152,14 @@ def screen_on_date(hists, codes, names, as_of):
     if MAX_SAME_INDUSTRY > 0:
         ind_count, dedup = {}, []
         for r in picks:
-            ind = r["行业"] or get_industry_of(r["代码"], name=r["名称"]) or "未知"
-            r["行业"] = ind
-            if ind_count.get(ind, 0) >= MAX_SAME_INDUSTRY:
-                continue
-            ind_count[ind] = ind_count.get(ind, 0) + 1
+            # 行业只用本地名称关键词兜底：get_industry_of 会打东财个股信息接口，
+            # 东财被封时每次请求都要等满超时（60s），回溯直接卡死（2026-09-08 实测）。
+            ind = _industry_by_name(r["名称"]) or ""
+            r["行业"] = ind or "未知"
+            if ind and ind_count.get(ind, 0) >= MAX_SAME_INDUSTRY:
+                continue          # 行业未知时不参与去重，避免误杀
+            if ind:
+                ind_count[ind] = ind_count.get(ind, 0) + 1
             dedup.append(r)
         picks = dedup
     return picks[:3]

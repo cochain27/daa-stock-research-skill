@@ -261,7 +261,7 @@ def run_daily():
     boards = top_industry_boards(industry)
 
     # 市场环境判定（强势市→波段为主 / 弱势市→短线为主）
-    from market_analysis import judge_market_env, shortline_gate
+    from market_analysis import judge_market_env, shortline_gate, trend_gate
     from fetch_data import get_index_daily
     idx_df = get_index_daily("sh000001")
     market_env, env_desc, env_reason = judge_market_env(idx_df, temp, snapshot)
@@ -270,13 +270,17 @@ def run_daily():
     # ① 右侧趋势通道：横盘放量突破，2-4周持仓
     trend_picks = []
     if TREND_ENABLED:
-        try:
-            trend_picks = pick_trend_stocks(snapshot, boards=boards, n=TREND_MAX_PICKS)
-            for p in trend_picks:
-                p["strategy_tag"] = "趋势"
-            print(f"[右侧趋势] 推荐 {len(trend_picks)} 只: {', '.join(p['名称'] for p in trend_picks)}")
-        except Exception as e:
-            print(f"[右侧趋势] 出票异常 {e}")
+        tg_open, tg_reason = trend_gate()
+        if not tg_open:
+            print(f"[右侧趋势] 休战：{tg_reason}")
+        else:
+            try:
+                trend_picks = pick_trend_stocks(snapshot, boards=boards, n=TREND_MAX_PICKS)
+                for p in trend_picks:
+                    p["strategy_tag"] = "趋势"
+                print(f"[右侧趋势] 推荐 {len(trend_picks)} 只: {', '.join(p['名称'] for p in trend_picks)}")
+            except Exception as e:
+                print(f"[右侧趋势] 出票异常 {e}")
     trend_codes = {p["symbol"] for p in trend_picks}
 
     # ② 短线激进通道：情绪驱动 or 冰点抄底

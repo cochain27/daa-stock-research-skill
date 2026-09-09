@@ -180,6 +180,9 @@ def tech_break(r, price, mode="trend"):
         if mode == "short":
             if price < ma5:
                 return True, f"跌破MA5 {ma5:.2f}（现价{price:.2f}），短线生命线失守"
+            # 移动止盈（2026-09-09：止盈1减半后剩余仓位让利润奔跑，跌破MA10清仓）
+            if ret > 3 and price < ma10:
+                return True, f"盈利{ret:+.1f}%已减半，跌破MA10 {ma10:.2f}，移动止盈清仓"
         else:
             # 趋势走坏：MA10 下穿 MA20 且 现价跌破 MA10
             if ma10 < ma20 and price < ma10:
@@ -187,6 +190,9 @@ def tech_break(r, price, mode="trend"):
             # 盈利>3% 跌破MA10 → 移动止盈离场
             if ret > 3 and price < ma10:
                 return True, f"盈利{ret:+.1f}%已上移成本线，跌破MA10 {ma10:.2f}，移动止盈离场"
+            # MA20 结构止损（2026-09-09：仅趋势票，收盘跌破MA20即离场，替代纯固定百分比）
+            if str(r.get("策略标签", "")) == "趋势" and price < ma20:
+                return True, f"跌破MA20 {ma20:.2f}（现价{price:.2f}），趋势结构破坏离场"
     except Exception:
         pass
     return False, ""

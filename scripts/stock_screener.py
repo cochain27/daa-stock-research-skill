@@ -18,9 +18,11 @@ from config import (SCORE_WEIGHTS, ALLOW_CODE_PREFIX, MAX_SAME_INDUSTRY,
                     SHORT_STOP_LOSS, SHORT_TAKE_PROFIT_1, SHORT_TAKE_PROFIT_2,
                     SWING_MAX_PICKS,
                     TREND_ENABLED, TREND_MAX_PICKS, TREND_MIN_MARKET_CAP,
-                    TREND_MIN_60D_POS, TREND_MAX_20D_AMPLITUDE, TREND_MAX_20D_STD_RATIO,
+                    TREND_MIN_60D_POS, TREND_MIN_60D_POS_LOW, TREND_MAX_20D_AMPLITUDE, TREND_MAX_20D_STD_RATIO,
                     TREND_BREAKOUT_VOL_RATIO, TREND_MIN_AMOUNT,
                     TREND_BREAKOUT_CHG_RANGE, TREND_HOLD_DAYS, TREND_EXTEND_MAX_DAYS,
+                    TREND_STOP_LOSS, TREND_TAKE_PROFIT_1, TREND_TAKE_PROFIT_2,
+                    SHORTLINE_MAX_UPPER_SHADOW,
                     BOTTOM_FISHING_ENABLED, BOTTOM_FISHING_TEMP_MAX,
                     BOTTOM_FISHING_ZT_MIN, BOTTOM_FISHING_MAX_PICKS)
 
@@ -903,6 +905,22 @@ def pick_shortline_stocks(snapshot, n=2, exclude_codes=None):
             # 快照来源的票需复查：涨幅够但已回落到近涨停以下的才留（避免收进慢涨票）
             if c["来源"].startswith("快照") and q.get("涨跌幅", 0) < SHORTLINE_MIN_CHG:
                 continue
+            # 上影过滤（2026-09-09 回测：冲高回落>3% 剔除，胜率 45.0→47.2%、盈亏比 1.59→1.69）
+            hi_q = float(q.get("最高", 0) or 0)
+            if hi_q > 0 and (hi_q - price) / hi_q > SHORTLINE_MAX_UPPER_SHADOW:
+                continue
+            # 量比门槛（2026-09-09：缩量冲高不参与）
+            if SHORTLINE_MIN_VOL_RATIO > 0 and float(q.get("量比", 0) or 0) < SHORTLINE_MIN_VOL_RATIO:
+                continue
+            # 剔除昨日涨停票（2026-09-09：避免高位接力，昨日涨停今日溢价风险大）
+            if SHORTLINE_EXCLUDE_YESTERDAY_ZT:
+                h = get_stock_hist(code, days=10)
+                if h is not None and len(h) >= 3:
+                    h = h.sort_values("日期").reset_index(drop=True)
+                    c1, c2 = float(h["收盘"].iloc[-2]), float(h["收盘"].iloc[-3])
+                    zt_pct = 19.5 if code.startswith("30") else 9.5
+                    if c2 > 0 and (c1 / c2 - 1) * 100 >= zt_pct:
+                        continue
 
             chg = q.get("涨跌幅", c["涨跌幅"])
             hs = q.get("换手率", c["换手率"])
@@ -1160,9 +1178,14 @@ def pick_trend_stocks(snapshot=None, boards=None, n=2, exclude_codes=None):
                 continue
 
             chg_today = q.get("涨跌幅", 0)
-            # 条件2：60日价格位置<45%
-            pos60 = float(last.get("位置60D", 0.5))
-            if pos60 >= TREND_MIN_60D_POS:
+            # 条件2：60日价格位置<70%（2026-09-09 v3 规则。
+            # 原值0.45与"突破20/60日新高"逻辑互斥——收盘创60日新高则位置必为100%。
+            # 修复 2026-09-08 bug：原代码 last.get("位置60D", 0.5) 读的是从未生产的字段，恒为 0.5）
+            h60 = hist.tail(60)
+            lo60, hi60 = float(h60["收盘"].min()), float(h60["收盘"].max())
+            pos60 = (close - lo60) / (hi60 - lo60) if hi60 > lo60 else 0.5
+            if pos60 >= TREND_MIN_60D_POS or pos60 < TREND_MIN_60D_POS_LOW:
+                # 2026-09-09：位置≥70% 追高；<30% 深跌弱势、趋势未确认（回测证伪率高）
                 continue
             # 条件3：横盘特征
             recent20 = hist.tail(20)
@@ -1173,10 +1196,9 @@ def pick_trend_stocks(snapshot=None, boards=None, n=2, exclude_codes=None):
             # 条件4：放量突破
             if vol < avg_vol20 * TREND_BREAKOUT_VOL_RATIO:
                 continue
-            # 条件5：突破阳线（收盘突破近20日和60日最高收盘）
-            max20_close = recent20["收盘"].max()
-            max60_close = hist.tail(60)["收盘"].max()
-            if close <= max20_close or close <= max60_close:
+            # 条件5：站上MA20（2026-09-09 v3 规则：删除原"突破20/60日最高收盘"——
+            # 与60日低位条件互斥，是趋势策略长期0出票的根因）
+            if close <= ma20:
                 continue
             chg_min, chg_max = TREND_BREAKOUT_CHG_RANGE
             if not (chg_min * 100 <= chg_today <= chg_max * 100):
@@ -1197,8 +1219,8 @@ def pick_trend_stocks(snapshot=None, boards=None, n=2, exclude_codes=None):
                     macd_ok = True  # 近3日内金叉
             if not macd_ok:
                 continue
-            # 条件8：RSI健康区间
-            rsi = float(last.get("RSI", 50))
+            # 条件8：RSI健康区间（修复 2026-09-08 bug：字段名是 RSI14，原读 "RSI" 恒为默认 50）
+            rsi = float(last.get("RSI14", 50))
             if not (40 <= rsi <= 70):
                 continue
             # 条件9：流通市值（用成交额/换手率粗估，或跳过）
@@ -1208,9 +1230,10 @@ def pick_trend_stocks(snapshot=None, boards=None, n=2, exclude_codes=None):
             low20 = recent20["最低"].min()
             buy_lo = round(max(low20, close * 0.98), 2)
             buy_hi = round(close * 1.01, 2)
-            stop_loss = round(close * (1 + SHORT_STOP_LOSS), 2)
-            tp1 = round(close * (1 + SHORT_TAKE_PROFIT_1), 2)
-            tp2 = round(close * (1 + SHORT_TAKE_PROFIT_2), 2)
+            # 趋势独立风控（修复 2026-09-08 bug：此前错误复用短线 -4%/+5%/+8%）
+            stop_loss = round(close * (1 + TREND_STOP_LOSS), 2)
+            tp1 = round(close * (1 + TREND_TAKE_PROFIT_1), 2)
+            tp2 = round(close * (1 + TREND_TAKE_PROFIT_2), 2)
             hold_min, hold_max = TREND_HOLD_DAYS
             signals = []
             if close > ma10 > ma20:
@@ -1242,6 +1265,7 @@ def pick_trend_stocks(snapshot=None, boards=None, n=2, exclude_codes=None):
                 "信号": "、".join(signals),
                 "横盘幅度": f"{amp20:.1%}",
                 "放量倍数": round(vol / avg_vol20, 1),
+                "量比": round(vol / avg_vol20, 1),
                 "60日位置": round(pos60, 2),
             })
         except Exception:
@@ -1260,7 +1284,8 @@ def pick_trend_stocks(snapshot=None, boards=None, n=2, exclude_codes=None):
             dedup.append(r)
         picks = dedup
 
-    picks.sort(key=lambda x: x.get("放量倍数", 0), reverse=True)
+    # 排序优选（2026-09-09）：信号冲突时按「60日位置低优先 + 量比大优先」
+    picks.sort(key=lambda x: (x.get("60日位置", 1), -x.get("量比", 0)))
     return picks[:n]
 
 
@@ -1348,8 +1373,8 @@ def bottom_fishing_picks(snapshot=None, temp=30, board_zt_count=None, n=2, exclu
             # 条件5：当日非涨停
             if zt_price and price >= zt_price * 0.97:
                 continue
-            # 条件6：RSI区间
-            rsi = float(last.get("RSI", 50))
+            # 条件6：RSI区间（修复 2026-09-08 bug：同趋势策略，字段应为 RSI14）
+            rsi = float(last.get("RSI14", 50))
             if not (25 <= rsi <= 50):
                 continue
             # 条件4：跑输大盘（今日跌幅大于指数跌幅，简化用平均市场跌幅-2%）
