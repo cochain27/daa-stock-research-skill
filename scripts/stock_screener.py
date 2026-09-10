@@ -10,7 +10,7 @@ from fetch_data import (get_market_snapshot, get_industry_boards,
                         get_stock_hist, get_stock_info, get_stock_fund_flow,
                         get_realtime_quotes, get_industry_of, get_zt_pool_cached,
                         get_valuation_baidu, get_financial_indicators, _sina_symbol,
-                        get_stock_zt_pool, get_stock_zb_pool)
+                        get_stock_zt_pool, get_stock_zb_pool, get_industry_em)
 from config import (SCORE_WEIGHTS, ALLOW_CODE_PREFIX, MAX_SAME_INDUSTRY,
                     ZT_THRESHOLD, ZT_BAN, ZT_LIMIT_5DAY, ZT_MAX_LIANG,
                     VAL_W, VAL_PE_OK, VAL_PE_WARN, VAL_PB_OK, VAL_PB_WARN,
@@ -24,7 +24,11 @@ from config import (SCORE_WEIGHTS, ALLOW_CODE_PREFIX, MAX_SAME_INDUSTRY,
                     TREND_STOP_LOSS, TREND_TAKE_PROFIT_1, TREND_TAKE_PROFIT_2,
                     SHORTLINE_MAX_UPPER_SHADOW,
                     BOTTOM_FISHING_ENABLED, BOTTOM_FISHING_TEMP_MAX,
-                    BOTTOM_FISHING_ZT_MIN, BOTTOM_FISHING_MAX_PICKS)
+                    BOTTOM_FISHING_ZT_MIN, BOTTOM_FISHING_MAX_PICKS,
+                    LOW_POS_MAX_20D_AMP, LOW_POS_MAX_20D_STD,
+                    LOW_POS_MIN_DIST_60D_HIGH, LOW_POS_BEST_POS, LOW_POS_BEST_AMOUNT,
+                    LOW_POS_HEAT_BONUS, LOW_POS_HEAT_MAIN_ONLY)
+from industry_heat_tool import industry_heat_status_simple, load_heat
 
 
 # ============ 第一步：价值初筛 ============
@@ -809,7 +813,8 @@ def pick_shortline_stocks(snapshot, n=2, exclude_codes=None):
     候选池（只收未封死的票，推荐即虚拟成交）：
     a. 炸板池：曾涨停后开板的票（回封博弈主战场）
     b. 涨停池炸板过的票（开板后回封，复查是否真封死）
-    c. 快照涨幅榜：涨幅≥SHORTLINE_MIN_CHG 且未达近涨停（现价/涨停价<ZT_THRESHOLD）的冲高强势票
+    c. 快照涨幅榜：涨幅≥SHORTLINE_MIN_CHG 的冲高强势票（近涨停不剔，2026-09-10 回测：
+       剔除≥9% 反而砍掉最赚钱的创业近涨停梯队，胜×盈亏 79.95→72.17）
     排除：ST/退、非白名单、停牌（盘口最高=0）、封死（现价≥涨停价×0.997）、
           连板>SHORTLINE_MAX_LIANBAN、波段通道已推荐（exclude_codes）
     评分：情绪评分 0-100（涨幅动能/换手/炸板/板块梯队/量比/回封动能）
@@ -857,7 +862,7 @@ def pick_shortline_stocks(snapshot, n=2, exclude_codes=None):
                     "来源": "炸板池(开板)",
                 }
 
-    # 快照冲高强势票（涨幅≥SHORTLINE_MIN_CHG，未近涨停）
+    # 快照冲高强势票（涨幅≥SHORTLINE_MIN_CHG；近涨停不剔——2026-09-10 回测：创业近涨停梯队是利润核心）
     if snapshot is not None and not snapshot.empty:
         snap = snapshot.copy()
         snap["代码"] = snap["代码"].astype(str).str.replace(r"\.0$", "", regex=True)
@@ -1048,6 +1053,23 @@ def low_pos_watch(snapshot=None, top_n=3, exclude_codes=None):
             pos = (close - lo60) / (hi60 - lo60)
             if pos >= 0.40:  # 必须低位
                 continue
+            # ===== 前兆筛选（2026-09-10 转化研究落地：剔劣三件套）=====
+            # 研究：低位池→趋势池转化率 10.5%。成功转化票启动前形态：
+            #   横盘紧凑（振幅<15%/波动<4%）+ 贴近60日高点（距>-22%）+ 未提前上涨
+            # 剔劣三件套 → 转化率 16.1%（样本 16743→3988，足量）
+            amp20 = (ind["收盘"].tail(20).max() - ind["收盘"].tail(20).min()) / ind["收盘"].tail(20).mean()
+            std20 = ind["收盘"].tail(20).std() / ind["收盘"].tail(20).mean()
+            dist60 = (close / hi60 - 1) * 100
+            if amp20 >= LOW_POS_MAX_20D_AMP:
+                continue          # 波动过大：蓄势期混乱，启动概率低
+            if std20 >= LOW_POS_MAX_20D_STD:
+                continue          # 收盘波动率过高：不稳
+            if dist60 <= LOW_POS_MIN_DIST_60D_HIGH:
+                continue          # 深跌远离前高：仍在下行通道，非蓄势
+            # 排序加分（不硬过滤）：位置最优区间 0.20-0.40、成交额 2-8 亿
+            pos_bonus = 1 if LOW_POS_BEST_POS[0] <= pos < LOW_POS_BEST_POS[1] else 0
+            amt = float(row.get("成交额", 0)) if not pd.isna(row.get("成交额", 0)) else 0
+            amt_bonus = 1 if LOW_POS_BEST_AMOUNT[0] <= amt < LOW_POS_BEST_AMOUNT[1] else 0
             # 启动信号计数
             signals = []
             ma20 = last["MA20"]
@@ -1070,8 +1092,17 @@ def low_pos_watch(snapshot=None, top_n=3, exclude_codes=None):
             zt_price = q.get("涨停价")
             if price and zt_price and price / zt_price >= ZT_THRESHOLD:
                 continue
-            # 行业
-            industry = get_industry_of(code, name=name) or "未知"
+            # 行业：优先东财三级名（与板块热度精确匹配），兜底原逻辑
+            industry = get_industry_em(code) or get_industry_of(code, name=name) or "未知"
+            # 行业热度排序加分（2026-09-10 归因落地）：近5日板块涨幅前15上榜天数
+            # 归因结论：热度对转化率无增益（10.5→11.2%），但热度>=3 组的7日胜率显著更高
+            # （48.3% vs 46.3%），且"前兆+热度"叠加后7日胜率54.2%（基线45.5%）。
+            # 低位池的定位是"埋伏真启动"（转化率优先）→ 热度仅做排序加分不硬过滤。
+            _h_tag, _h_rank, _h_tot, _h_last = industry_heat_status_simple(industry, window=5, top_n=15)
+            if LOW_POS_HEAT_BONUS:
+                heat_bonus = 1 if _h_tag == "🔥主线" else (0 if LOW_POS_HEAT_MAIN_ONLY else (0.5 if _h_tag == "🌤升温" else 0))
+            else:
+                heat_bonus = 0
             # 买点参考（收盘价基准，1-2周波段）
             buy_lo = round(min(close, float(ma5)) * 0.99, 2)
             buy_hi = round(close * 1.03, 2)
@@ -1081,13 +1112,16 @@ def low_pos_watch(snapshot=None, top_n=3, exclude_codes=None):
                 "5日涨幅": round(chg5, 1), "行业": industry,
                 "买点区间": f"{buy_lo}-{buy_hi}",
                 "止损价": round(close * 0.94, 2),
-                "关注逻辑": f"60日低位({pos:.0%})，{ '、'.join(signals) }，趋势启动初现可跟踪",
+                "关注逻辑": f"60日低位({pos:.0%})，{'、'.join(signals)}，横盘蓄势紧凑、贴近60日高点，趋势启动初现可跟踪",
+                "_pos_bonus": pos_bonus, "_amt_bonus": amt_bonus, "_heat_bonus": heat_bonus,
             })
         except Exception:
             continue
 
-    # 信号数优先排序，行业去重
-    picks.sort(key=lambda x: (-len(x["信号"].split("、")), x["60日位置"]))
+    # 排序：信号数优先，其次位置/成交额/行业热度加分（前兆+热度研究：最优区间加分）
+    picks.sort(key=lambda x: (-len(x["信号"].split("、")),
+                              -(x.get("_pos_bonus", 0) + x.get("_amt_bonus", 0) + x.get("_heat_bonus", 0)),
+                              x["60日位置"]))
     if MAX_SAME_INDUSTRY > 0:
         ind_count = {}
         dedup = []

@@ -199,6 +199,37 @@ def get_stock_info(symbol):
         return {}
 
 
+# 东财三级行业名缓存：避免重复查 f127
+_IND_EM_CACHE = {}
+
+
+def get_industry_em(symbol):
+    """个股所属东财三级行业名（f127，如'IT服务Ⅱ''半导体'）。
+    绕代理直连 push2delay.eastmoney.com（2026-09-09 实测 push2 全站被 IP 级风控
+    返回空，push2delay 延迟行情 host 可用且 f127 字段同构）。
+    失败返回 None（调用方自行兜底）。进程内缓存。
+    """
+    symbol = str(symbol).split(".")[0]
+    if not symbol:
+        return None
+    if symbol in _IND_EM_CACHE:
+        return _IND_EM_CACHE[symbol]
+    market = "1" if symbol.startswith("6") else "0"
+    try:
+        r = requests.get(
+            f"https://push2delay.eastmoney.com/api/qt/stock/get?secid={market}.{symbol}&fields=f57,f58,f127",
+            headers={"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"},
+            timeout=_HTTP_TIMEOUT,
+        )
+        d = r.json().get("data") or {}
+        name = (d.get("f127") or "").strip() or None
+        _IND_EM_CACHE[symbol] = name
+        return name
+    except Exception:
+        _IND_EM_CACHE[symbol] = None
+        return None
+
+
 # ============ 估值补充源（百度，东财不稳时的兜底） ============
 
 def get_valuation_baidu(symbol):

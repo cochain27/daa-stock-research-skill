@@ -115,7 +115,7 @@ VARIANTS = {
     "orig": dict(pos=0.45, brk20=True, brk60=True),
     "v1":   dict(pos=0.45, brk20=True, brk60=False),
     "v2":   dict(pos=0.70, brk20=True, brk60=False),
-    "v3":   dict(pos=0.70, brk20=False, brk60=False),
+    "v3":   dict(pos=0.70, brk20=False, brk60=False, pos_low=TREND_MIN_60D_POS_LOW),
 }
 
 
@@ -140,6 +140,9 @@ def _pick_trend(feats, codes, names, as_of, fixed=False, variant="orig"):
                 continue
             pos60 = r["pos60"] if fixed else 0.5
             if not (pos60 < cfg["pos"]):
+                continue
+            if fixed and cfg.get("pos_low") and not (pos60 >= cfg["pos_low"]):
+                # 2026-09-09：<30% 深跌弱势、趋势未确认（回测胜率 46.8→53.4%）
                 continue
             if not (r["amp20"] < TREND_MAX_20D_AMPLITUDE):
                 continue
@@ -220,6 +223,10 @@ def _pick_short(feats, codes, names, as_of, v2=False):
             else:
                 if vr < 1.5:
                     continue
+            # 上影过滤（2026-09-09 回测：冲高回落>3% 剔除，胜率 45.0→47.2%）
+            up = (float(r["high"]) - float(r["close"])) / float(r["close"])
+            if up > SHORTLINE_MAX_UPPER_SHADOW:
+                continue
             if not (r["pos60"] < 0.70):   # 不追高位
                 continue
         except Exception:

@@ -33,7 +33,11 @@ import pandas as pd
 import requests
 
 from fetch_data import get_market_snapshot, _industry_by_name  # 超时 patch + 快照 + 本地行业兜底
+from industry_heat_tool import industry_heat_status_simple
 from stock_screener import _tech_indicators, ALLOW_CODE_PREFIX, MAX_SAME_INDUSTRY
+from config import (LOW_POS_MAX_20D_AMP, LOW_POS_MAX_20D_STD,
+                    LOW_POS_MIN_DIST_60D_HIGH, LOW_POS_BEST_POS, LOW_POS_BEST_AMOUNT,
+                    LOW_POS_HEAT_BONUS, LOW_POS_HEAT_MAIN_ONLY)
 from close_review import _archive_watch
 
 CAND_TOP = 1200        # 候选池大小（按当前成交额排序）
@@ -120,6 +124,25 @@ def screen_on_date(hists, codes, names, as_of):
             pos = (close - lo60) / (hi60 - lo60)
             if pos >= MAX_POS:
                 continue
+            # ===== 前兆筛选（2026-09-10 与线上 low_pos_watch 同步）=====
+            amp20 = (ind["收盘"].tail(20).max() - ind["收盘"].tail(20).min()) / ind["收盘"].tail(20).mean()
+            std20 = ind["收盘"].tail(20).std() / ind["收盘"].tail(20).mean()
+            dist60 = (close / hi60 - 1) * 100
+            if amp20 >= LOW_POS_MAX_20D_AMP:
+                continue
+            if std20 >= LOW_POS_MAX_20D_STD:
+                continue
+            if dist60 <= LOW_POS_MIN_DIST_60D_HIGH:
+                continue
+            pos_bonus = 1 if LOW_POS_BEST_POS[0] <= pos < LOW_POS_BEST_POS[1] else 0
+            amt = float(sub["成交额"].iloc[-1])
+            amt_bonus = 1 if LOW_POS_BEST_AMOUNT[0] <= amt < LOW_POS_BEST_AMOUNT[1] else 0
+            # 行业热度加分（2026-09-10 与线上 low_pos_watch 同步）
+            _h_tag, *_ = industry_heat_status_simple(_industry_by_name(names.get(code, "")), window=5, top_n=15)
+            if LOW_POS_HEAT_BONUS:
+                heat_bonus = 1 if _h_tag == "🔥主线" else (0 if LOW_POS_HEAT_MAIN_ONLY else (0.5 if _h_tag == "🌤升温" else 0))
+            else:
+                heat_bonus = 0
             ma5, ma20 = last["MA5"], last["MA20"]
             signals = []
             if close > ma20:
@@ -143,12 +166,15 @@ def screen_on_date(hists, codes, names, as_of):
                 "5日涨幅": round(chg5, 1), "行业": "",
                 "买点区间": f"{buy_lo}-{buy_hi}",
                 "止损价": round(close * 0.94, 2),
-                "关注逻辑": f"60日低位({pos:.0%})，{'、'.join(signals)}，趋势启动初现可跟踪",
+                "关注逻辑": f"60日低位({pos:.0%})，{'、'.join(signals)}，横盘蓄势紧凑、贴近60日高点，趋势启动初现可跟踪",
+                "_pos_bonus": pos_bonus, "_amt_bonus": amt_bonus, "_heat_bonus": heat_bonus,
             })
         except Exception:
             continue
 
-    picks.sort(key=lambda x: (-len(x["信号"].split("、")), x["60日位置"]))
+    picks.sort(key=lambda x: (-len(x["信号"].split("、")),
+                              -(x.get("_pos_bonus", 0) + x.get("_amt_bonus", 0) + x.get("_heat_bonus", 0)),
+                              x["60日位置"]))
     if MAX_SAME_INDUSTRY > 0:
         ind_count, dedup = {}, []
         for r in picks:
