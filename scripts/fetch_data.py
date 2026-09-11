@@ -91,11 +91,24 @@ def get_index_daily(symbol="sh000001", days=250):
 
 def get_market_snapshot():
     """全A实时快照，统一列：代码/名称/最新价/涨跌幅/成交额/换手率/市盈率-动态/市净率
-    （新浪源无 PE/PB，置 None）"""
+    （新浪源无 PE/PB，置 None）。
+    2026-09-10 修复：数据源全部失败时返回【空 DataFrame】而非抛异常——
+    下游 score_sentiment/score_volume 已容忍空快照走"数据不足(中性)"分，
+    避免 close_review/daily_report 因快照失败在第一步整体崩溃、推送静默丢失。"""
+    _COLUMNS = ["代码", "名称", "最新价", "涨跌幅", "成交额", "换手率", "市盈率-动态", "市净率"]
+    df = None
     try:
         df = _retry(lambda: ak.stock_zh_a_spot(), tries=3, name="新浪全A")
     except Exception:
-        df = _retry(lambda: ak.stock_zh_a_spot_em(), tries=2, name="东财全A")
+        df = None
+    if df is None or df.empty:
+        try:
+            df = _retry(lambda: ak.stock_zh_a_spot_em(), tries=2, name="东财全A")
+        except Exception:
+            df = None
+    if df is None or df.empty:
+        # 双源全挂：返回空结构（下游自动中性分），不抛异常阻断主流程
+        return pd.DataFrame(columns=_COLUMNS)
     if "代码" not in df.columns:  # 东财列名适配
         df = df.rename(columns={"序号": "序号"})
     # 新浪列：代码(sh600519)/名称/最新价/涨跌额/涨跌幅/... → 代码统一为纯6位数字
@@ -117,7 +130,9 @@ def get_market_snapshot():
 
 def get_industry_boards():
     """行业板块行情。返回 (df, source)。
-    df统一列：板块名称/涨跌幅/总成交额/换手率/领涨股票/公司家数"""
+    df统一列：板块名称/涨跌幅/总成交额/换手率/领涨股票/公司家数
+    2026-09-10 修复：双源全失败返回空 df（source='none'），不抛异常阻断主流程。"""
+    _COLS = ["板块名称", "涨跌幅", "总成交额", "换手率", "领涨股票", "公司家数"]
     try:
         df = _retry(lambda: ak.stock_sector_spot(indicator="新浪行业"), tries=2, name="新浪行业")
         df = df.rename(columns={
@@ -129,8 +144,12 @@ def get_industry_boards():
         df["涨跌幅"] = pd.to_numeric(df["涨跌幅"], errors="coerce")
         return df, "sina"
     except Exception:
+        pass
+    try:
         df = _retry(lambda: ak.stock_board_industry_name_em(), tries=2, name="东财行业")
         return df, "em"
+    except Exception:
+        return pd.DataFrame(columns=_COLS), "none"
 
 
 def get_concept_boards():

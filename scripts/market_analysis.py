@@ -239,6 +239,23 @@ def calc_market_temperature():
     return round(temp, 0), details
 
 
+def safe_market_temperature():
+    """温度计安全包装：任何数据源失败都不抛异常，返回 (temp, details, ok)。
+    ok=False 表示走中性兜底（正文应标注"数据降级"）。供 daily_report / noon_review /
+    close_review 统一使用，避免全A快照/指数失败时主流程整体崩溃导致推送静默丢失。"""
+    try:
+        temp, details = calc_market_temperature()
+        return temp, details, True
+    except Exception as e:
+        print(f"[温度计] 计算失败，降级中性温度: {e}")
+        neutral = {"趋势": {"分": 50, "说明": f"数据降级: {str(e)[:60]}"},
+                   "情绪": {"分": 50, "说明": "数据降级"},
+                   "量能": {"分": 50, "说明": "数据降级"},
+                   "资金": {"分": 50, "说明": "数据降级"},
+                   "体制": {"分": 50, "说明": "数据降级"}}
+        return 50.0, neutral, False
+
+
 def decide_position(temp):
     """温度→仓位建议"""
     if temp >= 75:

@@ -2,7 +2,7 @@
 """日报生成：完整日报 + 精简版推送文本"""
 from datetime import datetime
 import pandas as pd
-from market_analysis import calc_market_temperature, decide_position, single_stock_position, judge_market_env
+from market_analysis import calc_market_temperature, safe_market_temperature, decide_position, single_stock_position, judge_market_env
 from stock_screener import (top_industry_boards, pick_top_stocks, value_screen, pick_quality,
                             pick_shortline_stocks, pick_trend_stocks, bottom_fishing_picks,
                             _is_trend, _is_short)
@@ -254,7 +254,7 @@ def generate_brief(temp, pos_advice, boards, picks, track_rows=None, track_overv
 
 def run_daily():
     """主流程：分析→双通道选股（短线激进+右侧波段）→生成日报→虚拟盘建仓校验"""
-    temp, details = calc_market_temperature()
+    temp, details, _temp_ok = safe_market_temperature()
     pos_advice = decide_position(temp)
     snapshot = get_market_snapshot()
     industry, _src = get_industry_boards()

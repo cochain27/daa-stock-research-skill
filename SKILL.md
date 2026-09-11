@@ -77,6 +77,7 @@ pip install -r requirements.txt
   {"enabled": true, "default_channel": "pushplus", "pushplus_token": "你的pushplus令牌", "serverchan_key": ""}
   ```
   渠道二选一：PushPlus 填 `pushplus_token`；Server酱 填 `serverchan_key` 并把 `default_channel` 改为 `serverchan`。该文件已被 .gitignore 排除，不会入库。
+- **数据源容错（2026-09-10 修复）**：`get_market_snapshot()`/`get_industry_boards()` 双源（新浪→东财）全部失败时**返回空 DataFrame 而非抛异常**，下游评分函数自动走"数据不足(中性)"分。温度计统一用 `market_analysis.safe_market_temperature()`（任何环节失败降级中性温度，返回 `(temp, details, ok)`），**保证 daily_report / noon_review / close_review 不因数据源抖动在第一步崩溃 → 推送静默丢失**。close_review 推送异常也会打日志（不再 `pass` 吞掉）。
 - **研究层增强（依赖外部 skill `stock-researcher`）**：通过 `scripts/skill_bridge.py` 桥接，缺失时**全部静默降级为 None**（日报照跑，但研究板块变空）：
   | 桥接函数 | 提供能力 |
   |---|---|

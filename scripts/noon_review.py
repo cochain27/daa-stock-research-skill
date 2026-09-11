@@ -7,7 +7,7 @@ import json
 from datetime import datetime
 from pathlib import Path
 import pandas as pd
-from market_analysis import calc_market_temperature, decide_position, judge_market_env
+from market_analysis import calc_market_temperature, safe_market_temperature, decide_position, judge_market_env
 from fetch_data import get_market_snapshot, get_industry_boards, get_realtime_quotes, get_index_daily
 from trend_tracker import analyze_track_pool as trend_analyze
 from short_tracker import analyze_track_pool as short_analyze
@@ -32,7 +32,7 @@ def _tag_icon(tag, extended=False):
 def run_noon():
     today = datetime.now().strftime("%Y-%m-%d")
     now = datetime.now().strftime("%H:%M")
-    temp, details = calc_market_temperature()
+    temp, details, _temp_ok = safe_market_temperature()
     pos = decide_position(temp)
     snap = get_market_snapshot()
     industry, _ = get_industry_boards()

@@ -9,7 +9,7 @@ import json, csv, re
 from datetime import datetime, timedelta
 from pathlib import Path
 import pandas as pd
-from market_analysis import calc_market_temperature, decide_position, judge_market_env
+from market_analysis import calc_market_temperature, safe_market_temperature, decide_position, judge_market_env
 from fetch_data import get_market_snapshot, get_industry_boards, get_realtime_quotes, get_index_daily
 from trend_tracker import analyze_track_pool as trend_analyze, update_track as trend_update, stats as trend_stats
 from short_tracker import analyze_track_pool as short_analyze, update_track as short_update, stats as short_stats, roll_backtest
@@ -334,18 +334,28 @@ def _nav_line(nav):
 def run_close():
     today = datetime.now().strftime("%Y-%m-%d")
     now = datetime.now().strftime("%H:%M")
-    temp, details = calc_market_temperature()
+    # 2026-09-10 修复：温度计任一步失败不得阻断收盘复盘整体流程（曾因全A快照失败
+    # 在第一步崩溃 → 复盘文件不生成 + 微信推送静默丢失）。失败时用中性温度兜底，
+    # 复盘正文标注"数据降级"，推送照常必达。
+    temp, details, _temp_ok = safe_market_temperature()
     pos = decide_position(temp)
     industry, _ = get_industry_boards()
 
     # 市场环境判定
     idx_df = get_index_daily("sh000001")
-    market_env, env_desc, env_reason = judge_market_env(idx_df, temp, None)
+    market_env, env_desc, env_reason = None, None, ""
+    try:
+        market_env, env_desc, env_reason = judge_market_env(idx_df, temp, None)
+    except Exception as e:
+        print(f"[环境判定] 失败降级: {e}")
+        env_reason = f"环境数据降级({str(e)[:40]})"
 
     lines = [f"# 收盘复盘 {today}（{now}）\n"]
     env_s = f"【{market_env}（{env_desc}）】" if market_env else ""
     lines.append(f"**{env_s}收盘市场温度：{temp:.0f}/100 → {pos[0]}（{pos[1].split('：')[0]}）**")
     lines.append(f"**环境判定：{env_reason}**\n")
+    if not _temp_ok:
+        lines.append("> ⚠️ 本日温度计数据源异常，以上为中性兜底值；若为盘中请稍后重跑。\n")
     lines.append("| 维度 | 分值 | 说明 |")
     lines.append("|------|------|------|")
     for k, v in details.items():
@@ -653,8 +663,8 @@ def run_close():
         from notify import push_report
         ok, ch, msg = push_report(f"收盘复盘 {today}", out)
         print(f"[微信推送] {'成功' if ok else '跳过/失败: '+msg}")
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[微信推送] 异常(内容已保存本地): {e}")
 
 
 if __name__ == "__main__":
