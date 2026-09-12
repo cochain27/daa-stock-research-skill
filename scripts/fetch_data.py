@@ -6,6 +6,11 @@
 import os
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")  # 保护 akshare 百度源 numpy 线程
 import socket
+import sys
+# WorkBuddy shim sitecustomize 劫持了 sys.path，akshare 在 default venv 里
+_venv_pkg = "/Users/chenyuting/.workbuddy/binaries/python/envs/default/lib/python3.13/site-packages"
+if _venv_pkg not in sys.path:
+    sys.path.insert(0, _venv_pkg)
 import time
 import akshare as ak
 import pandas as pd

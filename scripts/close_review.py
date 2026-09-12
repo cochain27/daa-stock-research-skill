@@ -18,8 +18,8 @@ from config import REVIEW_DIR, PUSH_DIR, VIRTUAL_ENABLED
 BASE = Path(__file__).resolve().parent.parent
 
 
-WATCH_FIELDS = ["日期", "代码", "名称", "现价", "60日位置", "信号", "5日涨幅",
-                "行业", "买点区间", "止损价", "关注逻辑"]
+WATCH_FIELDS = ["日期", "代码", "名称", "现价", "60日位置", "量比", "5日涨幅",
+                "行业", "买点区间", "止损价", "蓄势路径", "状态"]
 
 INDUSTRY_HEAT_FILE = BASE / "data" / "industry_heat.csv"
 
@@ -173,7 +173,9 @@ def _archive_watch(watch, today):
         with path.open(encoding="utf-8") as f:
             rows = [r for r in csv.DictReader(f) if r.get("日期") != today]
     for w in watch:
-        rows.append({"日期": today, **{k: w.get(k, "") for k in WATCH_FIELDS[1:]}})
+        rec = {"日期": today, **{k: w.get(k, "") for k in WATCH_FIELDS[1:]}}
+        rec["状态"] = rec.get("状态") or "观察中"   # 新入库默认观察中
+        rows.append(rec)
     rows.sort(key=lambda r: (r.get("日期", ""), r.get("代码", "")))
     with path.open("w", newline="", encoding="utf-8") as f:
         wr = csv.DictWriter(f, fieldnames=WATCH_FIELDS)
@@ -197,7 +199,7 @@ def _track_watch_pool(today, lookback_days=10):
     if not path.exists():
         return []
 
-    # 读取近 N 天记录
+    # 读取近 N 天记录（自然日窗口，含周末/节假日）
     cutoff = (datetime.now() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
     all_rows = []
     with path.open(encoding="utf-8") as f:
@@ -208,11 +210,42 @@ def _track_watch_pool(today, lookback_days=10):
     if not all_rows:
         return []
 
+    # ===== 交易日历：上证指数K线日期（真实交易日，含9-10/9-11等未归档日）=====
+    # 2026-09-11 修复：此前从 watch_history 收集日期推导交易日，但 csv 只记录"入选日"、
+    #   9-10/9-11 未归档 → 天数被低估（中国电影9-11报3天、实际跨6交易日）。
+    # 上证指数每个交易日必有K线 → 是最可靠的交易日序列。
+    today_s = today.strftime("%Y-%m-%d") if hasattr(today, "strftime") else str(today)
+    _trade_days = []
+    try:
+        from fetch_data import get_stock_hist as _gh
+        _idx = _gh("000001", days=max(40, lookback_days * 2))
+        _trade_days = [str(d)[:10] for d in _idx["日期"].dt.strftime("%Y-%m-%d").tolist()]
+    except Exception:
+        _trade_days = []
+    if not _trade_days:
+        # 兜底：watch_history 去重日期 + 今日（缺失中间交易日仍会低估，但至少含首日/今日）
+        _trade_days = set()
+        with path.open(encoding="utf-8") as f:
+            for r in csv.DictReader(f):
+                _trade_days.add(r.get("日期", ""))
+        _trade_days.add(today_s)
+        _trade_days = sorted(d for d in _trade_days if d >= cutoff)
+
     # 按代码分组：记录首次出现日期、出现次数、最新一条的信息
     from collections import defaultdict
     by_code = defaultdict(list)
     for r in all_rows:
         by_code[r["代码"]].append(r)
+
+    # 2026-09-12 修复：回溯体检标记"已失效"的存量票不再进入跟踪。
+    # 判定口径：该 code 最新一条记录状态为"已失效" → 整组剔除（历史观察中行保留审计）。
+    invalid_codes = set()
+    for code, rs in by_code.items():
+        rs_sorted = sorted(rs, key=lambda r: r["日期"])
+        if rs_sorted[-1].get("状态", "") == "已失效":
+            invalid_codes.add(code)
+    for code in invalid_codes:
+        del by_code[code]
 
     # 批量拉今日现价
     codes = list(by_code.keys())
@@ -254,14 +287,31 @@ def _track_watch_pool(today, lookback_days=10):
             first_price = None
 
         first_date = rows[0]["日期"]
-        days_count = len(rows)
+        # 天数 = 首次入选日到"今日"的交易日跨度（含首日与今日）
+        # 修复 2026-09-11：此前 days_count=len(rows) 只在入选日+1，
+        #   未入选日（如9-09断档）不累计 → 中国电影9-10报4天(实际跨5交易日)、
+        #   9-11报3天(实际跨6交易日) 倒挂。改用交易日跨度：
+        #   days = 交易日序列中 first_date..today 的个数（若今日无记录，
+        #   以 last_hist_date 兜底，保证≥入选次数）。
+        last_hist_date = rows[-1]["日期"]
+        _d = [d for d in _trade_days if first_date <= d <= today_s]
+        days_count = len(_d)
+        if days_count < len(rows):   # 兜底：交易日序列不完整时至少等于入选次数
+            days_count = len(rows)
+        days_count = max(1, days_count)
         try:
             chg_since = (cur_price / first_price - 1) * 100 if cur_price and first_price else None
         except Exception:
             chg_since = None
 
         # 状态判定
-        if days_count == 1:
+        # 2026-09-11 修复"首现"语义：此前只看 days_count==1 → 光电股份9-02已入选、
+        #   今天涨停再入选仍标🆕首现(1天)，自相矛盾。正确口径：
+        #   - "首现" = 今天首次进入观察池（rows[-1]是今天 且 今天之前无记录）
+        #   - 连续N天 = 从首次入选日到今天一直在跟踪（无论中间是否每天入选）
+        #   注意：历史入选过但近10日没再出现（today 无记录）→ 不算"今天新筛出"，
+        #   但仍在追踪池内 → 显示"连续N天"（N=距今天跨度），不显示"首现"。
+        if last_hist_date == today_s and len(rows) == 1:
             status = f"🆕首现（{first_date}），观察中"
             status_tag = "🆕首现"
             action = "观察"
@@ -542,9 +592,12 @@ def run_close():
         print(f"[主线概览] 失败 {e}")
 
     try:
-        from stock_screener import low_pos_watch
+        from low_pos_entry import pick_low_pos_entry
         track_codes = [r["代码"] for r in track_rows] if track_rows else []
-        watch = low_pos_watch(top_n=3, exclude_codes=track_codes)
+        # 策略与日报同步：pick_low_pos_entry 双路径候选
+        candidates = pick_low_pos_entry(top=600, quiet=True)
+        # 排除已在跟踪池的票
+        watch = [w for w in candidates if w.get("代码") not in track_codes][:3]
         lines.append("## 本周低位启动观察（趋势侧跟踪池补充）\n")
         if mainline:
             lines.append("**🔥 持续主线行业（近5日板块涨幅居前≥3日）：** " + "、".join(f"{n}（{rd}/{td}日）" for n, rd, td in mainline))
@@ -554,17 +607,23 @@ def run_close():
                 _archive_watch(watch, today)
             except Exception as e:
                 print(f"[低位观察] 归档失败 {e}")
-            lines.append("### 今日新筛出（待观察）\n")
-            lines.append("| 股票 | 行业热度 | 现价 | 60日位置 | 启动信号 | 5日涨幅 | 买点区间 | 止损 |")
-            lines.append("|------|----------|------|----------|----------|---------|----------|------|")
+            lines.append("### 今日低位埋伏候选（策略同步日报）\n")
+            # 行业去重展示（同 pick_low_pos_entry 内置去重逻辑）
+            shown = []
+            seen_ind = set()
             for w in watch:
-                ind_name = w.get("行业", "")
-                heat_tag, rank_days, heat_days, last_rank = _industry_heat_status(ind_name, today)
-                heat_s = f"{heat_tag}" + (f"{rank_days}/{heat_days}日" if rank_days else "")
-                lines.append(f"| {w['名称']}({w['代码']}) | {heat_s} | {w['现价']} | {w['60日位置']:.0%} | {w['信号']} | +{w['5日涨幅']:.1f}% | {w['买点区间']} | {w['止损价']} |")
-            lines.append("")
-            lines.append("关注逻辑：" + "；".join(f"{w['名称']}: {w['关注逻辑']}" for w in watch))
-            lines.append("> 说明：基于收盘数据筛选，供本周跟踪（不追高，回踩买点或放量突破再介入）。")
+                ind = w.get("行业", "未知")
+                if ind in seen_ind:
+                    continue
+                seen_ind.add(ind)
+                shown.append(w)
+            if shown:
+                lines.append("| 股票 | 行业 | 现价 | 60日位置 | 量比 | 5日涨幅 | 振幅 | 买点区间 | 止损 | 蓄势路径 |")
+                lines.append("|------|------|------|----------|------|---------|------|----------|------|----------|")
+                for w in shown:
+                    lines.append(f"| {w['名称']}({w['代码']}) | {w.get('行业','未知')} | {w['现价']:.2f} | {w['60日位置']:.0%} | {w['量比']:.2f}x | {w['5日涨幅%']:+.1f}% | {w['20日振幅%']:.0f}% | {w['买点区间']} | {w['止损价']:.2f} | {w.get('蓄势路径','标准蓄势')} |")
+                lines.append("")
+            lines.append("> ⚠️ 研究观察池（两路径并存：标准蓄势+近期超卖；参数=量比2-7x+成交额4-16亿+涨幅9-15%+位置<55%；回测11只：大赚27%、大亏0%、T5均值+8.4%）；**非买入推荐**，仅供盘后复盘研究参考。")
             lines.append("")
         else:
             lines.append("今日未筛出符合条件的低位启动股（可能整体处于高位或数据缺失），可关注明日更新。")

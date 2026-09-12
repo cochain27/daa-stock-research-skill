@@ -27,7 +27,7 @@ from config import (SCORE_WEIGHTS, ALLOW_CODE_PREFIX, MAX_SAME_INDUSTRY,
                     BOTTOM_FISHING_ZT_MIN, BOTTOM_FISHING_MAX_PICKS,
                     LOW_POS_MAX_20D_AMP, LOW_POS_MAX_20D_STD,
                     LOW_POS_MIN_DIST_60D_HIGH, LOW_POS_BEST_POS, LOW_POS_BEST_AMOUNT,
-                    LOW_POS_HEAT_BONUS, LOW_POS_HEAT_MAIN_ONLY)
+                    LOW_POS_HARD_POS_AMOUNT, LOW_POS_HEAT_BONUS, LOW_POS_HEAT_MAIN_ONLY)
 from industry_heat_tool import industry_heat_status_simple, load_heat
 
 
@@ -1022,7 +1022,10 @@ def low_pos_watch(snapshot=None, top_n=3, exclude_codes=None):
     # 流动性 + 当日温和
     df = df[pd.to_numeric(df["成交额"], errors="coerce").fillna(0) > 1.5e8]
     if "涨跌幅" in df.columns:
-        df = df[df["涨跌幅"].between(-4, 4)]
+        # 2026-09-11 修复：放开涨停——低位+首板涨停正是最强启动信号，
+        # 原-4%~+4%过滤把"涨停+放量启动"当过热误杀（光电股份9-11 10%涨停3倍量未入选）。
+        # 保留下跌端过滤（-4%以下仍剔除，深跌非蓄势），上涨端只挡一字板（-1%~+1%开盘即封）。
+        df = df[df["涨跌幅"] >= -4]
     # 活跃度排序取前 80 只做技术扫描（控制耗时）
     if "换手率" in df.columns:
         df["_liq"] = df["换手率"].fillna(0).clip(0, 15)
@@ -1060,16 +1063,34 @@ def low_pos_watch(snapshot=None, top_n=3, exclude_codes=None):
             amp20 = (ind["收盘"].tail(20).max() - ind["收盘"].tail(20).min()) / ind["收盘"].tail(20).mean()
             std20 = ind["收盘"].tail(20).std() / ind["收盘"].tail(20).mean()
             dist60 = (close / hi60 - 1) * 100
+            # 当日涨幅（涨停/大涨判定）
+            try:
+                _dchg_now = float(last["涨跌幅"]) if last.get("涨跌幅") is not None else (
+                    (close / float(ind.iloc[-2]["收盘"]) - 1) * 100 if len(ind) >= 2 else 0)
+            except (ValueError, TypeError, KeyError):
+                _dchg_now = 0.0
+            _is_burst = _dchg_now >= 7   # 涨停/放量大涨 = 启动确认，非蓄势期
             if amp20 >= LOW_POS_MAX_20D_AMP:
                 continue          # 波动过大：蓄势期混乱，启动概率低
             if std20 >= LOW_POS_MAX_20D_STD:
                 continue          # 收盘波动率过高：不稳
-            if dist60 <= LOW_POS_MIN_DIST_60D_HIGH:
-                continue          # 深跌远离前高：仍在下行通道，非蓄势
-            # 排序加分（不硬过滤）：位置最优区间 0.20-0.40、成交额 2-8 亿
-            pos_bonus = 1 if LOW_POS_BEST_POS[0] <= pos < LOW_POS_BEST_POS[1] else 0
+            # 2026-09-11 修复：当日涨停/大涨（≥7%）跳过 dist60 深跌剔除。
+            # 原逻辑 dist60<=-22% 一刀切剔除"深跌远离前高" → 光电股份9-11 涨停突破近10日新高
+            # （60日高33.55是2个月前的深跌顶）被误判"下行通道非蓄势"。
+            # 但涨停放量=启动确认，不再属于"蓄势前兆"路径 → 不受此约束。
+            if not _is_burst and dist60 <= LOW_POS_MIN_DIST_60D_HIGH:
+                continue          # 非启动日：深跌远离前高仍在下行通道，非蓄势
+            # 位置/成交额最优区间（2026-09-12 升级为硬过滤：研究 17.9%/18.2% 即硬过滤口径）
             amt = float(row.get("成交额", 0)) if not pd.isna(row.get("成交额", 0)) else 0
+            pos_bonus = 1 if LOW_POS_BEST_POS[0] <= pos < LOW_POS_BEST_POS[1] else 0
             amt_bonus = 1 if LOW_POS_BEST_AMOUNT[0] <= amt < LOW_POS_BEST_AMOUNT[1] else 0
+            if LOW_POS_HARD_POS_AMOUNT and not _is_burst:
+                # 蓄势前兆路径：位置/成交额必须落在最优区间（硬过滤）
+                if not (LOW_POS_BEST_POS[0] <= pos < LOW_POS_BEST_POS[1]):
+                    continue   # 位置偏离最优区间（<0.20 深跌 / 0.40 已不在低位）
+                if not (LOW_POS_BEST_AMOUNT[0] <= amt < LOW_POS_BEST_AMOUNT[1]):
+                    continue   # 成交额偏离 2-8 亿（太小流动性差 / 太大已非中小盘弹性票）
+            # 启动确认路径（≥7%）：跳过位置/成交额约束，仅保留加分用于排序
             # 启动信号计数
             signals = []
             ma20 = last["MA20"]
@@ -1084,14 +1105,35 @@ def low_pos_watch(snapshot=None, top_n=3, exclude_codes=None):
             chg5 = (close / float(ind.iloc[-6]["收盘"]) - 1) * 100 if len(ind) >= 6 else 0
             if 2 <= chg5 <= 12:
                 signals.append(f"5日+{chg5:.1f}%")
+            # 2026-09-11 修复：当日涨停/大涨作为强启动信号直接计入（chg5 上限 12 会卡掉涨停当天）
+            if last.get("涨跌幅") is not None:
+                _dchg = float(last["涨跌幅"])
+            else:
+                _dchg = (close / float(ind.iloc[-2]["收盘"]) - 1) * 100 if len(ind) >= 2 else 0
+            if _dchg >= 7:
+                signals.append(f"当日+{_dchg:.1f}%")
             if len(signals) < 2:
                 continue
             # 当日近涨停剔除
+            # 2026-09-11 修复：涨停≠剔。低位+首板涨停放量 = 最强启动信号（光电股份9-11）。
+            # 原 price/zt>=0.95 一刀切剔除 → 换手板被误杀。
+            # 新口径：只剔"一字板/秒板"（今开即涨停价且封单>0，无换手空间无法介入），
+            #       换手板（开盘低于涨停、盘中拉起封板）保留入选。
             q = quotes.get(code, {})
             price = q.get("现价") or close
             zt_price = q.get("涨停价")
-            if price and zt_price and price / zt_price >= ZT_THRESHOLD:
-                continue
+            is_zt = price and zt_price and price / zt_price >= ZT_THRESHOLD
+            if is_zt:
+                open_px = q.get("今开") or float(last.get("开盘", 0)) if last is not None else 0
+                try:
+                    open_px = float(open_px)
+                except (ValueError, TypeError):
+                    open_px = 0
+                is_yizi = open_px > 0 and open_px >= zt_price * 0.995   # 开盘即涨停
+                if is_yizi:
+                    continue                   # 一字板：无法参与，剔除
+                if "当日+" not in "、".join(signals):
+                    signals.append(f"涨停{_dchg:+.1f}%")   # 换手板：标注启动属性
             # 行业：优先东财三级名（与板块热度精确匹配），兜底原逻辑
             industry = get_industry_em(code) or get_industry_of(code, name=name) or "未知"
             # 行业热度排序加分（2026-09-10 归因落地）：近5日板块涨幅前15上榜天数
@@ -1325,7 +1367,7 @@ def pick_trend_stocks(snapshot=None, boards=None, n=2, exclude_codes=None):
 
 # ============ 冰点抄底子模块：bottom_fishing_picks()（2026-09-05 双策略分立） ============
 
-def bottom_fishing_picks(snapshot=None, temp=30, board_zt_count=None, n=2, exclude_codes=None):
+def bottom_fishing_picks(snapshot=None, temp=30, board_zt_count=None, n=2, exclude_codes=None, temp_min=None):
     """冰点抄底选股：温度≤35且涨停家数极少时，启动短线激进冰点抄底子模块。
     定位：短线激进子模块，市场情绪冰点期选被错杀的强势票（并非选超跌垃圾票）。
     选的是"质地好但被大盘拖累错杀"的票——近期强势（有净流入/高换手）但随大盘补跌，
@@ -1342,10 +1384,20 @@ def bottom_fishing_picks(snapshot=None, temp=30, board_zt_count=None, n=2, exclu
 
     风控：止损-5%，止盈+5%/+8%，持股不超过5天（短线本质）。
     返回 list[dict]，字段格式同 pick_shortline_stocks()。
+
+    2026-09-11 修复：新增 temp_min 参数（默认 SHORTLINE_TEMP_MIN=50）。
+    冰点抄底同属短线通道，温度<50 不得出票（弱势期短线期望为负），
+    与仓位档位（温度<35→0%避险）联动，杜绝「避险档还推新票」的矛盾。
     """
     if not BOTTOM_FISHING_ENABLED:
         return []
     if temp > BOTTOM_FISHING_TEMP_MAX:
+        return []
+    # 2026-09-11 修复：冰点抄底也受短线温度闸门约束（默认与常规短线一致 ≥50）
+    if temp_min is None:
+        from config import SHORTLINE_TEMP_MIN
+        temp_min = SHORTLINE_TEMP_MIN
+    if temp < temp_min:
         return []
     if snapshot is None:
         snapshot = get_market_snapshot()

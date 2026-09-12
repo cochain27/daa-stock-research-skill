@@ -202,6 +202,99 @@ def _render_pick_card(d):
     return "".join(h)
 
 
+def _render_low_pos_summary():
+    """低位埋伏策略统计摘要 → 概览卡"""
+    return (
+        '<div class="rt-card">'
+        '<div class="rt-card-h">📊 低位埋伏策略统计（60只触发票·两路径并存）</div>'
+        '<div class="rt-card-b">'
+        '<table class="rt-grid">'
+        '<tr>'
+        '<td class="rt-lab">蓄势位置</td><td><b>&lt;55%</b></td>'
+        '<td class="rt-lab">触发涨幅</td><td><b>9-15%</b></td>'
+        '<td class="rt-lab">触发量比</td><td><b>2.0-7x</b></td>'
+        '</tr>'
+        '<tr>'
+        '<td class="rt-lab">触发成交额</td><td colspan="5"><b>4-16亿（16亿以下0大亏）</b></td>'
+        '</tr>'
+        '<tr>'
+        '<td class="rt-lab">大赚T5≥10%</td><td><b class="up">27%</b></td>'
+        '<td class="rt-lab">大亏T5≤-10%</td><td><b>0%</b></td>'
+        '<td class="rt-lab">T5均值</td><td><b class="up">+8.4%</b></td>'
+        '</tr>'
+        '</table>'
+        '<div class="rt-warn">⚠️ 两路径并存（标准蓄势+近期超卖），核心目标提高转化率；11只样本，仅供复盘参考，非买入推荐</div>'
+        '</div></div>'
+    )
+
+
+def _render_low_pos_card(picks):
+    """低位埋伏候选 → 股票信息卡（手机端友好，非普通表格行）"""
+    if not picks:
+        return ""
+    cards = []
+    for p in picks:
+        name = p.get("名称", "?")
+        code = p.get("代码", "?")
+        path = p.get("蓄势路径", "标准蓄势")
+        path_icon = "📉" if path == "近期超卖" else "📊"
+        path_label = "超卖反弹" if path == "近期超卖" else "标准蓄势"
+
+        # 核心指标
+        pos60 = p.get("60日位置", "-")
+        try: pos60 = f"{float(pos60):.0%}"
+        except: pass
+        dist60 = p.get("dist60%", "-")
+        try: dist60 = f"{float(dist60):+.0f}%"
+        except: pass
+        lb = p.get("量比", "-")
+        try: lb = f"{float(lb):.2f}x"
+        except: pass
+        chg5 = p.get("5日涨幅%", "-")
+        try: chg5 = f"{float(chg5):+.1f}%"
+        except: pass
+        amp20 = p.get("20日振幅%", "-")
+        try: amp20 = f"{float(amp20):.0f}%"
+        except: pass
+        amt = p.get("成交额亿", "-")
+        try: amt = f"{float(amt):.1f}亿"
+        except: pass
+        feat = p.get("蓄势特征", "-")
+        buy_zone = p.get("买点区间", "-")
+        sl = p.get("止损价", "-")
+        try: sl = f"{float(sl):.2f}"
+        except: pass
+        ind = p.get("行业", "")
+
+        # 行业标签
+        ind_tag = f'<span class="rt-pill">{ind}</span>' if ind else ""
+
+        cards.append(
+            f'<div class="rt-card">'
+            f'<div class="rt-card-h">'
+            f'{path_icon} {name} <span class="rt-code">{code}</span>'
+            f'<span class="rt-badge">{path_label}</span>'
+            f'</div>'
+            f'<div class="rt-card-b">'
+            f'<table class="rt-grid">'
+            f'<tr><td class="rt-lab">60日位置</td><td><b>{pos60}</b></td>'
+            f'<td class="rt-lab">距高</td><td>{dist60}</td></tr>'
+            f'<tr><td class="rt-lab">量比</td><td>{lb}</td>'
+            f'<td class="rt-lab">5日涨幅</td><td>{chg5}</td></tr>'
+            f'<tr><td class="rt-lab">20日振幅</td><td>{amp20}</td>'
+            f'<td class="rt-lab">成交额</td><td>{amt}</td></tr>'
+            f'</table>'
+            f'<div class="rt-tech">{feat}</div>'
+            f'<table class="rt-grid" style="margin-top:3px">'
+            f'<tr><td class="rt-lab">买区</td><td><b>{buy_zone}</b></td>'
+            f'<td class="rt-lab">止损</td><td class="dn">{sl}</td></tr>'
+            f'</table>'
+            f'{ind_tag}'
+            f'</div></div>'
+        )
+    return "".join(cards)
+
+
 def _inline(text):
     """行内元素：加粗、涨跌着色"""
     text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
@@ -214,10 +307,16 @@ def md_to_mobile_html(md):
     """把我们日报的markdown转成手机端紧凑HTML（针对自有格式定制，非通用转换器）"""
     out = [_CSS, "<div>"]
     hero_done = False
+    in_low_pos_section = False  # 低位池章节内
+    low_pos_summary_done = False  # 已输出摘要卡
     lines = md.splitlines()
     i = 0
     while i < len(lines):
         ln = lines[i].rstrip()
+        # 低位埋伏章节开始
+        if re.match(r"## .*[低低位?启动]", ln):
+            in_low_pos_section = True
+            low_pos_summary_done = False
         # 表格块
         if ln.startswith("|") and i + 1 < len(lines) and set(lines[i + 1].replace("|", "").replace(" ", "")) <= set("-:"):
             headers = [c.strip() for c in ln.strip("|").split("|")]
@@ -235,6 +334,30 @@ def md_to_mobile_html(md):
                     else:
                         out.append(f'<div class="rt-item">{_inline(" | ".join(r))}</div>')
                 continue
+            # 低位埋伏候选池表格 → 卡片样式
+            is_low_pos_table = "蓄势路径" in headers or ("路径" in headers and "候选" in "".join(headers))
+            # 在低位池章节，第一个候选表前插入统计摘要卡
+            if in_low_pos_section and not low_pos_summary_done and is_low_pos_table:
+                out.append(_render_low_pos_summary())
+                low_pos_summary_done = True
+            if is_low_pos_table:
+                parsed_picks = []
+                for row in rows:
+                    if len(row) >= 6:
+                        pick = {}
+                        for ci, h in enumerate(headers):
+                            if ci < len(row):
+                                pick[h] = row[ci]
+                        name_code = row[headers.index("名称")] if "名称" in headers else (row[1] if len(row) > 1 else "")
+                        m = re.match(r"(.+?)（(\d{6})）", str(name_code))
+                        if m:
+                            pick["名称"] = m.group(1)
+                            pick["代码"] = m.group(2)
+                        if pick.get("名称") and pick.get("名称") != "名称":
+                            parsed_picks.append(pick)
+                if parsed_picks:
+                    out.append(_render_low_pos_card(parsed_picks))
+                    continue
             html = ["<table><tr>"] + [f"<th>{_inline(h)}</th>" for h in headers] + ["</tr>"]
             for r in rows:
                 html.append("<tr>" + "".join(f"<td>{_inline(c)}</td>" for c in r) + "</tr>")
@@ -248,6 +371,8 @@ def md_to_mobile_html(md):
                 if hero:
                     out.append(hero)
                     hero_done = True
+            in_low_pos_section = False
+            low_pos_summary_done = False
         elif re.match(r"###\s*\d+\.\s*.+?（\d{6}）", ln):
             # 推荐股块 → 卡片（收集到下一个###/##为止）
             block = [ln]
@@ -267,6 +392,10 @@ def md_to_mobile_html(md):
             out.append(f'<div class="rt-sub">{_inline(ln[4:])}</div>')
         elif ln.startswith("## "):
             out.append(f'<div class="rt-sec">{_inline(ln[3:])}</div>')
+            # 其他 ## 章节（非低位池）→ 重置状态
+            if not re.match(r"## .*[低低位?启动]", ln):
+                in_low_pos_section = False
+                low_pos_summary_done = False
         elif ln.startswith("> "):
             out.append(f'<div class="rt-quote">{_inline(ln[2:])}</div>')
         elif re.match(r"^\s*[-*] ", ln):

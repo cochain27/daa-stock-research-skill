@@ -15,9 +15,17 @@ from config import (PUSH_DIR, REVIEW_DIR,
                     SHORT_STOP_LOSS, SHORT_TAKE_PROFIT_1, SHORT_TAKE_PROFIT_2,
                     TREND_ENABLED, TREND_MAX_PICKS, BOTTOM_FISHING_TEMP_MAX)
 
+# 低位埋伏候选（观察池）：收盘后扫描 T-1 蓄势候选，不作为买入推荐
+try:
+    from low_pos_entry import pick_low_pos_entry
+    LOW_POS_ENTRY_ENABLED_REPORT = True
+except Exception:
+    LOW_POS_ENTRY_ENABLED_REPORT = False
+
 
 def generate_full_report(temp, details, pos_advice, boards, picks, rps_rows=None, track_rows=None, track_overview=None,
-                         market_env=None, env_desc=None, env_reason=None):
+                         market_env=None, env_desc=None, env_reason=None,
+                         low_pos_picks=None):
     """生成完整日报 markdown"""
     today = datetime.now().strftime("%Y-%m-%d")
     lines = []
@@ -163,6 +171,45 @@ def generate_full_report(temp, details, pos_advice, boards, picks, rps_rows=None
         else:
             lines.append(f"> ✅ 组合分散：推荐覆盖 {len(set(inds))} 个不同行业（{'、'.join(dict.fromkeys(inds))}），板块联动风险较低")
 
+    # 低位埋伏候选池（观察池）—— 2026-09-12 新增
+    # ⚠️ 本池为研究观察工具，非买入推荐。两路径并存（标准蓄势+近期超卖），仅供盘后复盘研究参考。
+    lines.append("## 三·低位埋伏候选池（观察）\n")
+    if not low_pos_picks:
+        lines.append("> 今日无低位埋伏候选（T-1 蓄势形态扫描结果）。\n")
+    else:
+        lines.append("> ⚠️ **研究观察池**：两路径并存（标准蓄势+近期超卖），参数=量比2-7x+成交额4-16亿+涨幅9-15%+位置<55%；回测11只：大赚(T5≥10%)27%、大亏0%、T5均值+8.4%。**非买入推荐**，仅供盘后复盘研究参考。\n")
+        lines.append("| # | 名称 | 路径 | 蓄势特征 | 候选日 | 现价 | 60日位置 | 距高% | 量比 | 成交额亿 | 买点区间 | 止损 | 止盈1 |")
+        lines.append("|---|------|------|----------|--------|------|----------|-------|------|----------|----------|------|-------|")
+        for i, p in enumerate(low_pos_picks, 1):
+            path_icon = "📉超卖" if p.get("蓄势路径") == "近期超卖" else "📊蓄势"
+            feat = p.get("蓄势特征", "-")
+            date = p.get("日期", "-")
+            close = p.get("现价", "-")
+            pos60 = p.get("60日位置", "-")
+            dist60 = p.get("dist60%", "-")
+            lb = p.get("量比", "-")
+            amt = p.get("成交额亿", "-")
+            buy_zone = p.get("买点区间", "-")
+            sl = p.get("止损价", "-")
+            tp1 = p.get("止盈1", "-")
+            try: close = f"{float(close):.2f}"
+            except: pass
+            try: pos60 = f"{float(pos60):.1%}"
+            except: pass
+            try: dist60 = f"{float(dist60):+.0f}%"
+            except: pass
+            try: lb = f"{float(lb):.2f}x"
+            except: pass
+            try: amt = f"{float(amt):.1f}亿"
+            except: pass
+            try: sl = f"{float(sl):.2f}"
+            except: pass
+            try: tp1 = f"{float(tp1):.2f}"
+            except: pass
+            lines.append(f"| {i} | {p['名称']}({p['代码']}) | {path_icon} | {feat} | {date} | {close} | {pos60} | {dist60} | {lb} | {amt} | {buy_zone} | {sl} | {tp1} |")
+        lines.append("")
+        lines.append("> 明日关注：若量比≥2.0x + 涨幅9-15% + 成交额4-16亿 + 突破MA20 → 可能触发买入信号（届时再做决策）\n")
+
     # 推荐跟踪池（连续跟踪分析）+ 虚拟净值
     lines.append("## 四、推荐跟踪池（连续跟踪）\n")
     if track_rows:
@@ -209,7 +256,8 @@ def generate_full_report(temp, details, pos_advice, boards, picks, rps_rows=None
     return "\n".join(lines)
 
 
-def generate_brief(temp, pos_advice, boards, picks, track_rows=None, track_overview=None, market_env=None):
+def generate_brief(temp, pos_advice, boards, picks, track_rows=None, track_overview=None, market_env=None,
+                   low_pos_picks=None):
     """精简版推送文本"""
     today = datetime.now().strftime("%m-%d")
     regime = pos_advice[1].split('：')[0] if '：' in pos_advice[1] else pos_advice[1]
@@ -249,6 +297,11 @@ def generate_brief(temp, pos_advice, boards, picks, track_rows=None, track_overv
                 nav_parts.append(f"短线净值{short_nav.get('净值', 0):.0f}({short_nav.get('累计收益率', 0):+.2f}%)")
             nav_s = ("  " + " / ".join(nav_parts)) if nav_parts else ""
             lines.append(f"汇总：{track_overview['总只数']}只 平均{track_overview['平均盈亏']:+.1f}%{nav_s}｜{track_overview['建议']}")
+    # 低位埋伏候选池（观察）—— 精简提示
+    if low_pos_picks:
+        names = "、".join(f"{p['名称']}({p['代码']})" for p in low_pos_picks[:3])
+        suffix = "…" if len(low_pos_picks) > 3 else ""
+        lines.append(f"📍低位埋伏（观察）{len(low_pos_picks)}只：{names}{suffix}（⚠️研究工具非推荐）")
     return "\n".join(lines)
 
 
@@ -296,6 +349,8 @@ def run_daily():
     else:
         print(f"[短线通道] 休战：{gate_reason}")
         # 冰点抄底：温度≤35时，即使短线休战也尝试冰点抄底
+        # 2026-09-11 修复：temp_min 默认=SHORTLINE_TEMP_MIN(50)，温度<50 不出新短线票
+        # （此前 temp≤35 直接开闸，与仓位档位 0% 避险冲突，弱势期出票期望为负）
         if temp <= BOTTOM_FISHING_TEMP_MAX:
             try:
                 short_picks = bottom_fishing_picks(snapshot, temp=temp, exclude_codes=trend_codes, n=2)
@@ -318,6 +373,16 @@ def run_daily():
             p["价值投资"] = get_value_decision(p["symbol"])
         except Exception:
             p["价值投资"] = None
+
+    # ===== 低位埋伏候选池扫描（收盘后观察池）—— 2026-09-12 新增 =====
+    low_pos_picks = []
+    if LOW_POS_ENTRY_ENABLED_REPORT:
+        try:
+            low_pos_picks = pick_low_pos_entry(snapshot=snapshot, top=600, quiet=True)
+            print(f"[低位埋伏] 候选 {len(low_pos_picks)} 只: {', '.join(p['名称'] for p in low_pos_picks[:5])}"
+                  + (f"…等" if len(low_pos_picks) > 5 else ""))
+        except Exception as e:
+            print(f"[低位埋伏] 扫描失败（{e}），跳过")
 
     # ===== 发报前最后一步：强制刷新最新实时行情（推荐股现价/涨跌幅） =====
     refresh_codes = [p["symbol"] for p in picks if p.get("symbol")]
@@ -381,9 +446,10 @@ def run_daily():
     }
 
     full = generate_full_report(temp, details, pos_advice, boards, picks, rps_rows, track_rows, track_overview,
-                                 market_env=market_env, env_desc=env_desc, env_reason=env_reason)
+                                 market_env=market_env, env_desc=env_desc, env_reason=env_reason,
+                                 low_pos_picks=low_pos_picks)
     brief = generate_brief(temp, pos_advice, boards, picks, track_rows, track_overview,
-                           market_env=market_env)
+                           market_env=market_env, low_pos_picks=low_pos_picks)
 
     # 风险日历排雷（2026-09-07 新增）：只提示不自动剔除，交由人工决策
     try:

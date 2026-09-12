@@ -85,25 +85,22 @@ def run_monitor():
             except (ValueError, TypeError):
                 return None
 
+        # 2026-09-11 修复：短线止损口径统一为 config.SHORT_STOP_LOSS（基准价重算），
+        # 与 short_tracker.update_track / daily_report 发报前刷新一致 —— 此前台账静态止损
+        # （-4% 时代写入）与盘中动态止损（-5.5%）不一致：监控报 47.32，台账 46.54。
+        # 止盈档位读台账字段（update_track 的 +5% 减半 + 移动止损 MA10 清仓），展期票直接用台账止盈。
+        from config import SHORT_STOP_LOSS
         checks = []
-        stop = _f(b.get("止损价"))
+        stop = None
         tp1 = _f(b.get("止盈1"))
         tp2 = _f(b.get("止盈2"))
         breakout = _f(b.get("突破买点"))
-
-        # 已展期票：止盈档位升级为 +10%/+15%（基于基准价重算）
-        # 短线票：覆盖为短线参数（台账可能存的是波段档位）
-        from config import (EXTEND_TP1, EXTEND_TP2,
-                            SHORT_STOP_LOSS, SHORT_TAKE_PROFIT_1, SHORT_TAKE_PROFIT_2)
         extended = info.get("展期", False)
         tag = info.get("策略标签", "波段")
         if tag == "短线" and base and base > 0:
-            stop = round(base * (1 + SHORT_STOP_LOSS), 2)
-            tp1 = round(base * (1 + SHORT_TAKE_PROFIT_1), 2)
-            tp2 = round(base * (1 + SHORT_TAKE_PROFIT_2), 2)
-        elif extended and base and base > 0:
-            tp1 = round(base * (1 + EXTEND_TP1), 2)
-            tp2 = round(base * (1 + EXTEND_TP2), 2)
+            stop = round(base * (1 + SHORT_STOP_LOSS), 2)   # 统一 -5.5%（覆盖台账旧值）
+        else:
+            stop = _f(b.get("止损价"))
 
         tag_icon = "⚡短线" if tag == "短线" else ("🟢展期" if extended else "📈波段")
         if stop and price <= stop:
@@ -121,6 +118,11 @@ def run_monitor():
             try:
                 lo, hi = [float(x) for x in rng.split("-")]
             except ValueError:
+                pass
+        elif rng.strip():   # 单值区间（冰点抄底 `"{base}"`）：±1% 内视为在买区
+            try:
+                lo, hi = float(rng) * 0.99, float(rng) * 1.01
+            except (ValueError, TypeError):
                 pass
         if breakout and price >= breakout:
             checks.append(("突破买点", f"🔥 跟踪池 {name}({code}) 现价{price} 突破买点{breakout}，可按计划介入"))

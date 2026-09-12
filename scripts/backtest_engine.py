@@ -1,3 +1,4 @@
+#!/Users/chenyuting/.workbuddy/binaries/python/versions/3.13.12/bin/python3
 # -*- coding: utf-8 -*-
 """双策略历史回放回测引擎（右侧趋势 + 短线激进）。
 
@@ -25,13 +26,19 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+# WorkBuddy shim 的 sitecustomize.py 劫持了 sys.path，导致 default venv 的
+# site-packages（akshare 在那）无法被找到。必须在任何 import 之前抢修复路径。
+_venv_pkg = "/Users/chenyuting/.workbuddy/binaries/python/envs/default/lib/python3.13/site-packages"
+if _venv_pkg not in sys.path:
+    sys.path.insert(0, _venv_pkg)
+
 import pandas as pd
 import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import fetch_data  # noqa: F401  触发超时 patch + 强制直连
-from fetch_data import get_market_snapshot, _industry_by_name
+import fetch_data  # noqa: F401  触发超时 patch
+from fetch_data import _industry_by_name
 from config import (ALLOW_CODE_PREFIX, MAX_SAME_INDUSTRY,
                     TREND_MIN_60D_POS, TREND_MIN_60D_POS_LOW, TREND_MAX_20D_AMPLITUDE, TREND_MAX_20D_STD_RATIO,
                     TREND_BREAKOUT_VOL_RATIO, TREND_MIN_AMOUNT, TREND_BREAKOUT_CHG_RANGE,
@@ -45,6 +52,13 @@ from config import (ALLOW_CODE_PREFIX, MAX_SAME_INDUSTRY,
 SINA_KLINE = "https://quotes.sina.cn/cn/api/json_v2.php/CN_MarketDataService.getKLineData"
 WORKERS = 10
 
+# 复用 fetch_data 的 Session patch（trust_env=False + 超时），避免系统代理拦截
+_sess = requests.Session()
+_sess.trust_env = False
+
+# 本地 K 线缓存目录（WestockData 落盘）
+_CACHE_DIR = Path(__file__).resolve().parent.parent / "data" / "klines"
+
 # 趋势风控（2026-09-09：直接从 config 读，已抽成常数）
 TREND_STOP = TREND_STOP_LOSS      # -0.06
 TREND_TP1 = TREND_TAKE_PROFIT_1   # 0.06
@@ -57,8 +71,8 @@ def _load_hist(code):
     """新浪公开 JSON 日线（纯 HTTP、并发安全；不复权）"""
     sym = ("sh" if code.startswith(("6", "9")) else "sz") + code
     try:
-        r = requests.get(SINA_KLINE, params={"symbol": sym, "scale": "240", "ma": "no",
-                                             "datalen": "300"}, timeout=20)
+        r = _sess.get(SINA_KLINE, params={"symbol": sym, "scale": "240", "ma": "no",
+                                           "datalen": "300"}, timeout=20)
         if r.status_code != 200:
             return code, None
         arr = json.loads(r.text)
@@ -68,6 +82,28 @@ def _load_hist(code):
                                                "low": "low", "close": "close", "volume": "vol"})
         df["date"] = pd.to_datetime(df["date"])
         for c in ["open", "high", "low", "close", "vol"]:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        df = df.sort_values("date").reset_index(drop=True)
+        df["amount"] = df["vol"] * df["close"]
+        if len(df) < 120:
+            return code, None
+        return code, df
+    except Exception:
+        return code, None
+
+
+def _load_hist_cache(code):
+    """从 WestockData 落盘的 CSV 读日线（前复权，字段：symbol,date,open,last,high,low,volume,amount,exchange）"""
+    sym = ("sh" if code.startswith(("6", "9")) else "sz") + code
+    p = _CACHE_DIR / f"{sym}.csv"
+    if not p.exists():
+        return code, None
+    try:
+        df = pd.read_csv(p, parse_dates=["date"])
+        df = df.rename(columns={"last": "close", "volume": "vol"})
+        df["vol"] = pd.to_numeric(df["vol"], errors="coerce")
+        df["amount"] = pd.to_numeric(df["amount"], errors="coerce")
+        for c in ["open", "high", "low", "close"]:
             df[c] = pd.to_numeric(df[c], errors="coerce")
         df = df.sort_values("date").reset_index(drop=True)
         df["amount"] = df["vol"] * df["close"]
@@ -169,7 +205,21 @@ def _pick_trend(feats, codes, names, as_of, fixed=False, variant="orig"):
                 continue
         except Exception:
             continue
-        out.append({"代码": code, "名称": names.get(code, code), "收盘": float(r["close"])})
+        # 因子快照：记录选股时（T-1收盘）的关键量价因子，供事后做「成功vs失败区分度体检」
+        out.append({
+            "代码": code, "名称": names.get(code, code), "收盘": float(r["close"]),
+            "_f": {
+                "pos60": float(r["pos60"]) if not pd.isna(r["pos60"]) else None,
+                "vol_ratio": float(r["vol_ratio"]) if not pd.isna(r["vol_ratio"]) else None,
+                "chg_pct": float(r["chg"]) * 100 if not pd.isna(r["chg"]) else None,
+                "amp20": float(r["amp20"]) if not pd.isna(r["amp20"]) else None,
+                "std20": float(r["std20"]) if not pd.isna(r["std20"]) else None,
+                "amount": float(r["amount"]),
+                "rsi14": float(r["rsi14"]) if not pd.isna(r["rsi14"]) else None,
+                "dif": float(r["dif"]) if not pd.isna(r["dif"]) else None,
+                "dea": float(r["dea"]) if not pd.isna(r["dea"]) else None,
+            },
+        })
     # 行业去重
     if MAX_SAME_INDUSTRY > 0:
         cnt, dedup = {}, []
@@ -231,7 +281,17 @@ def _pick_short(feats, codes, names, as_of, v2=False):
                 continue
         except Exception:
             continue
-        out.append({"代码": code, "名称": names.get(code, code), "收盘": float(r["close"])})
+        up_shadow = (float(r["high"]) - float(r["close"])) / float(r["close"])
+        out.append({
+            "代码": code, "名称": names.get(code, code), "收盘": float(r["close"]),
+            "_f": {
+                "pos60": float(r["pos60"]) if not pd.isna(r["pos60"]) else None,
+                "vol_ratio": float(r["vol_ratio"]) if not pd.isna(r["vol_ratio"]) else None,
+                "chg_pct": chg_pct,
+                "up_shadow": up_shadow,
+                "amount": float(r["amount"]),
+            },
+        })
     out.sort(key=lambda x: -x["收盘"])
     return out[:SHORTLINE_MAX_PICKS]
 
@@ -423,34 +483,80 @@ def main():
     ap.add_argument("--start", default="2026-03-01")
     ap.add_argument("--end", default=None)
     ap.add_argument("--top", type=int, default=1200)
+    ap.add_argument("--codes", default=None,
+                    help="逗号分隔的代码清单（绕过东财快照，用于快照被限流时）")
+    ap.add_argument("--cache", action="store_true",
+                    help="从本地 data/klines/ 落盘读取（WestockData，前复权），绕过所有网络请求")
     args = ap.parse_args()
     end = args.end or pd.Timestamp.now().strftime("%Y-%m-%d")
 
-    print(f"[1/4] 拉取全A快照，按成交额取前 {args.top} 只 ...", flush=True)
-    snap = get_market_snapshot()
-    if snap is None or snap.empty:
-        print("快照失败")
-        return 1
-    snap = snap.copy()
-    snap["代码"] = snap["代码"].astype(str).str.replace(r"\.0$", "", regex=True)
-    snap = snap[snap["代码"].str.match(r"^(?:" + "|".join(ALLOW_CODE_PREFIX) + ")", na=False)]
-    snap = snap[~snap["名称"].astype(str).str.contains("ST|退", na=False)]
-    snap["_amt"] = pd.to_numeric(snap.get("成交额"), errors="coerce").fillna(0)
-    snap = snap.sort_values("_amt", ascending=False).head(args.top)
-    codes = snap["代码"].tolist()
-    names = dict(zip(snap["代码"], snap["名称"].astype(str)))
+    if args.codes:
+        # 绕过东财快照：直接用传入代码池（名称用代码兜底，行业去重降级为不去重）
+        codes = [c.strip() for c in args.codes.split(",") if c.strip()]
+        codes = [c for c in codes if c.startswith(ALLOW_CODE_PREFIX)]
+        names = {c: c for c in codes}
+        snap = None
+        print(f"[1/4] 使用传入代码池 {len(codes)} 只（绕过东财快照）", flush=True)
+    else:
+        # 直调 Eastmoney 全A快照（akshare 分页拉 70 页太慢，改单次直调）
+        print(f"[1/4] 拉取全A快照，按成交额取前 {args.top} 只 ...", flush=True)
+        try:
+            r = _sess.get(
+                "https://push2.eastmoney.com/api/qt/clist/get",
+                params={
+                    "pn": 1, "pz": args.top, "po": 1, "np": 1,
+                    "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+                    "fltt": 2, "invt": 2,
+                    "fid": "f6",   # 按成交额排序
+                    "fs": "m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23",
+                    "fields": "f2,f3,f6,f8,f12,f14",
+                },
+                timeout=15,
+            )
+            data = r.json()
+            rows = data.get("data", {}).get("diff", [])
+            snap = pd.DataFrame(rows)
+            snap = snap.rename(columns={
+                "f2": "最新价", "f3": "涨跌幅", "f6": "成交额",
+                "f8": "换手率", "f12": "代码", "f14": "名称",
+            })
+            for c in ["最新价", "涨跌幅", "成交额", "换手率"]:
+                snap[c] = pd.to_numeric(snap.get(c, 0), errors="coerce").fillna(0)
+            print(f"  快照 {len(snap)} 只", flush=True)
+        except Exception as e:
+            print(f"快照失败: {e}")
+            return 1
+        snap = snap.copy()
+        snap["代码"] = snap["代码"].astype(str).str.replace(r"\.0$", "", regex=True)
+        snap = snap[snap["代码"].str.match(r"^(?:" + "|".join(ALLOW_CODE_PREFIX) + ")", na=False)]
+        snap = snap[~snap["名称"].astype(str).str.contains("ST|退", na=False)]
+        snap = snap.sort_values("成交额", ascending=False).head(args.top)
+        codes = snap["代码"].tolist()
+        names = dict(zip(snap["代码"], snap["名称"].astype(str)))
 
-    print(f"[2/4] 并发拉历史K线（{WORKERS} 线程）...", flush=True)
-    raw, t0 = {}, time.time()
-    with ThreadPoolExecutor(max_workers=WORKERS) as ex:
-        futs = {ex.submit(_load_hist, c): c for c in codes}
-        for i, fu in enumerate(as_completed(futs), 1):
-            c, h = fu.result()
+    if args.cache:
+        # 从本地落盘读取（无网络请求）
+        print(f"[2/4] 从本地缓存读取K线（{_CACHE_DIR}）...", flush=True)
+        raw, t0 = {}, time.time()
+        for i, c in enumerate(codes, 1):
+            _, h = _load_hist_cache(c)
             if h is not None:
                 raw[c] = h
             if i % 300 == 0:
                 print(f"  {i}/{len(codes)}  ok={len(raw)}  {time.time()-t0:.0f}s", flush=True)
-    print(f"  就绪 {len(raw)} 只，{time.time()-t0:.0f}s", flush=True)
+        print(f"  就绪 {len(raw)} 只，{time.time()-t0:.0f}s", flush=True)
+    else:
+        print(f"[2/4] 并发拉历史K线（{WORKERS} 线程）...", flush=True)
+        raw, t0 = {}, time.time()
+        with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+            futs = {ex.submit(_load_hist, c): c for c in codes}
+            for i, fu in enumerate(as_completed(futs), 1):
+                c, h = fu.result()
+                if h is not None:
+                    raw[c] = h
+                if i % 300 == 0:
+                    print(f"  {i}/{len(codes)}  ok={len(raw)}  {time.time()-t0:.0f}s", flush=True)
+        print(f"  就绪 {len(raw)} 只，{time.time()-t0:.0f}s", flush=True)
 
     print("[3/4] 向量化预计算特征 ...", flush=True)
     feats = {c: _features(h) for c, h in raw.items()}
@@ -461,8 +567,8 @@ def main():
 
     print("[4/4] 逐日回放 ...", flush=True)
 
-    def _run_trend(fixed, variant="orig"):
-        """fixed=False 复刻线上现状；fixed=True 修复位置60D/RSI/风控参数后"""
+    def _run_trend_orig(fixed=False, variant="orig"):
+        """原始版本（用于线上现状基准对比）：用 _simulate() 而非 _simulate_v2()"""
         tr = []
         for i in range(1, len(cal)):
             d_prev, d_now = cal[i - 1], cal[i]
@@ -472,53 +578,87 @@ def main():
                 if len(idx) == 0:
                     continue
                 ei = idx[0]
-                entry = float(f.iloc[ei]["open"])      # T 日开盘买入
+                entry = float(f.iloc[ei]["open"])
                 if entry <= 0:
                     continue
                 if fixed:
                     stop_pct, tp1, tp2 = TREND_STOP_LOSS, TREND_TP1, TREND_TP2
-                else:   # 线上现状：趋势错误复用了短线的 -4%/+5%/+8%
-                    stop_pct, tp1, tp2 = (SHORT_STOP_LOSS, SHORT_TAKE_PROFIT_1,
-                                          SHORT_TAKE_PROFIT_2)
-                pnl, days, why = _simulate(f, ei, entry, stop_pct, tp1, tp2,
-                                           TREND_MAX_HOLD)
-                tr.append({"买入日": str(d_now.date()), "代码": p["代码"], "名称": p["名称"],
-                           "买价": round(entry, 2), "收益%": round(pnl, 2),
-                           "持有天": days, "了结原因": why})
+                else:
+                    stop_pct, tp1, tp2 = (SHORT_STOP_LOSS, SHORT_TAKE_PROFIT_1, SHORT_TAKE_PROFIT_2)
+                pnl, days, why = _simulate(f, ei, entry, stop_pct, tp1, tp2, TREND_MAX_HOLD)
+                row = {"买入日": str(d_now.date()), "代码": p["代码"], "名称": p["名称"],
+                       "买价": round(entry, 2), "收益%": round(pnl, 2),
+                       "持有天": days, "了结原因": why}
+                row.update(p.get("_f") or {})
+                tr.append(row)
         return tr
 
-    def _run_trend_v2():
-        """2026-09-09 新趋势规则：pos60<0.70 + 站上MA20 + MA多头 + MACD + 量比，
-        结算用 MA20 结构止损 + 减半止盈 + 移动止损；温度门控(MA20上方占比≥55%)才开仓。
-        用 VARIANTS["v3"] 的选股口径（去掉突破新高）作为 v2 选股基座。"""
+    def _run_trend_v2(use_struct=True, open_conf=None, macd_zero_above=False, pos30_70=False,
+                      temp_gate=False):
+        """2026-09-09 新趋势规则 + 组合变体。
+        - use_struct=True  : MA20 结构止损（趋势专属）
+        - open_conf        : 开盘确认区间，如 (0, 0.035) 或 None
+        - macd_zero_above : MACD 需在零轴上方
+        - pos30_70        : 位置 30%-70%（T6 收紧）
+        - temp_gate       : 温度门控（MA20上方占比≥55%）
+        """
         tr = []
         for i in range(1, len(cal)):
             d_prev, d_now = cal[i - 1], cal[i]
-            if not _temp_proxy(feats, codes, d_prev):
-                continue   # 低温不开仓
+            if temp_gate and not _temp_proxy(feats, codes, d_prev):
+                continue
             for p in _pick_trend(feats, codes, names, d_prev, fixed=True, variant="v3"):
                 f = feats[p["代码"]]
                 idx = f.index[f["date"] == d_now]
                 if len(idx) == 0:
                     continue
                 ei = idx[0]
-                entry = float(f.iloc[ei]["open"])
+                row = f.iloc[ei]
+                entry = float(row["open"])
                 if entry <= 0:
                     continue
+                # 开盘确认
+                if open_conf:
+                    open_px, prev_close = float(row["open"]), float(f.iloc[ei - 1]["close"]) if ei > 0 else entry
+                    chg_o = (open_px / prev_close - 1) * 100
+                    if not (open_conf[0] * 100 <= chg_o <= open_conf[1] * 100):
+                        continue
+                # MACD 零轴上
+                if macd_zero_above and not (float(row["dif"]) > 0):
+                    continue
+                # 位置收紧 30-70
+                if pos30_70:
+                    pos60 = float(row["pos60"])
+                    if not (0.30 <= pos60 <= 0.70):
+                        continue
                 pnl, days, why = _simulate_v2(
                     f, ei, entry, TREND_STOP_LOSS, TREND_TP1, TREND_MAX_HOLD,
-                    time_stop_days=0, use_ma20_struct=True)
-                tr.append({"买入日": str(d_now.date()), "代码": p["代码"], "名称": p["名称"],
-                           "买价": round(entry, 2), "收益%": round(pnl, 2),
-                           "持有天": days, "了结原因": why})
+                    time_stop_days=0, use_ma20_struct=use_struct)
+                row = {"买入日": str(d_now.date()), "代码": p["代码"], "名称": p["名称"],
+                       "买价": round(entry, 2), "收益%": round(pnl, 2),
+                       "持有天": days, "了结原因": why}
+                row.update(p.get("_f") or {})
+                tr.append(row)
         return tr
 
-    trend_trades = _run_trend(fixed=False)
+    trend_trades = _run_trend_orig(fixed=False)
     print(f"  趋势(线上现状) {len(trend_trades)} 笔", flush=True)
-    trend_fixed = _run_trend(fixed=True)
+    trend_fixed = _run_trend_orig(fixed=True)
     print(f"  趋势(修复后·原规则) {len(trend_fixed)} 笔", flush=True)
-    trend_v2 = _run_trend_v2()
-    print(f"  趋势(2026-09-09新规则·MA20结构止损+温度门控) {len(trend_v2)} 笔", flush=True)
+    trend_v2 = _run_trend_v2(use_struct=True, temp_gate=False)
+    print(f"  趋势(2026-09-09新规则) {len(trend_v2)} 笔", flush=True)
+    # T6: 位置30-70
+    trend_t6 = _run_trend_v2(pos30_70=True, temp_gate=False)
+    print(f"  趋势(T6 位置30-70) {len(trend_t6)} 笔", flush=True)
+    # T7: 开盘确认0-3.5%
+    trend_t7 = _run_trend_v2(open_conf=(0, 0.035), temp_gate=False)
+    print(f"  趋势(T7 开盘确认0-3.5%) {len(trend_t7)} 笔", flush=True)
+    # T8: T6+T7 组合叠加
+    trend_t8 = _run_trend_v2(pos30_70=True, open_conf=(0, 0.035), temp_gate=False)
+    print(f"  趋势(T8 组合叠加) {len(trend_t8)} 笔", flush=True)
+    # T9: T6+T7+温度门控
+    trend_t9 = _run_trend_v2(pos30_70=True, open_conf=(0, 0.035), temp_gate=True)
+    print(f"  趋势(T9 组合+温度门控) {len(trend_t9)} 笔", flush=True)
 
     def _run_short(exit_new):
         """exit_new=True=新出场(移动止盈+时间止损+止损-5.5%)；入场门槛线上已回退（g1 被回测否定）"""
@@ -542,9 +682,11 @@ def main():
                     # 现状基准：复刻线上原规则（止损 -4%、止盈 +5%/+8%）
                     pnl, days, why = _simulate(f, ei, entry, -0.04, 0.05, 0.08,
                                                SHORT_HOLD_DAYS_MAX)
-                trades.append({"买入日": str(d_now.date()), "代码": p["代码"], "名称": p["名称"],
-                               "买价": round(entry, 2), "收益%": round(pnl, 2),
-                               "持有天": days, "了结原因": why})
+                row = {"买入日": str(d_now.date()), "代码": p["代码"], "名称": p["名称"],
+                       "买价": round(entry, 2), "收益%": round(pnl, 2),
+                       "持有天": days, "了结原因": why}
+                row.update(p.get("_f") or {})
+                trades.append(row)
             if i % 60 == 0:
                 print(f"  短线[exit_new={int(exit_new)}] {i}/{len(cal)}  {len(trades)}笔", flush=True)
         return trades
@@ -553,13 +695,65 @@ def main():
     print(f"  短线(线上现状) {len(short_trades)} 笔", flush=True)
     short_ea = _run_short(exit_new=True)
     print(f"  短线(新出场·最终形态) {len(short_ea)} 笔", flush=True)
+    # S4: 短线组合叠加（量比≥2+剔昨日涨停 已弃用；S4 实际无有效新组合，保留框架供参考）
+    # S5: 短线+温度门控（MA20上方占比≥60%）
+    def _run_short_v2(temp_gate=False, temp_thresh=0.60):
+        """短线+温度门控变体"""
+        trades = []
+        for i in range(1, len(cal)):
+            d_prev, d_now = cal[i - 1], cal[i]
+            if temp_gate:
+                above = total = 0
+                for c in codes:
+                    ff = feats.get(c)
+                    if ff is None:
+                        continue
+                    sub = ff[ff["date"] <= pd.Timestamp(d_prev)]
+                    if len(sub) < 30 or sub["date"].iloc[-1] != pd.Timestamp(d_prev):
+                        continue
+                    r = sub.iloc[-1]
+                    if pd.isna(r["ma20"]) or pd.isna(r["close"]):
+                        continue
+                    total += 1
+                    if float(r["close"]) > float(r["ma20"]):
+                        above += 1
+                if total >= 50 and (above / total) < temp_thresh:
+                    continue
+            for p in _pick_short(feats, codes, names, d_prev, v2=False):
+                f = feats[p["代码"]]
+                idx = f.index[f["date"] == d_now]
+                if len(idx) == 0:
+                    continue
+                ei = idx[0]
+                entry = float(f.iloc[ei]["open"])
+                if entry <= 0:
+                    continue
+                pnl, days, why = _simulate_v2(
+                    f, ei, entry, SHORT_STOP_LOSS, SHORT_TAKE_PROFIT_1,
+                    SHORT_HOLD_DAYS_MAX, SHORT_TIME_STOP_DAYS)
+                row = {"买入日": str(d_now.date()), "代码": p["代码"], "名称": p["名称"],
+                       "买价": round(entry, 2), "收益%": round(pnl, 2),
+                       "持有天": days, "了结原因": why}
+                row.update(p.get("_f") or {})
+                trades.append(row)
+            if i % 60 == 0:
+                print(f"  短线[temp_gate={int(temp_gate)}] {i}/{len(cal)}  {len(trades)}笔", flush=True)
+        return trades
+
+    short_s5 = _run_short_v2(temp_gate=True, temp_thresh=0.60)
+    print(f"  短线(S5 温度门控) {len(short_s5)} 笔", flush=True)
 
     print("\n" + "=" * 60)
-    st0 = _stats(trend_trades, "右侧趋势(线上现状)")
-    st1 = _stats(trend_fixed, "右侧趋势(修复后·原规则)")
-    st_tv2 = _stats(trend_v2, "右侧趋势(2026-09-09新规则)")
-    st2 = _stats(short_trades, "短线激进(线上现状)")
+    st0  = _stats(trend_trades, "右侧趋势(线上现状)")
+    st1  = _stats(trend_fixed, "右侧趋势(修复后·原规则)")
+    st_v2 = _stats(trend_v2, "右侧趋势(2026-09-09新规则)")
+    st_t6 = _stats(trend_t6, "右侧趋势(T6 位置30-70)")
+    st_t7 = _stats(trend_t7, "右侧趋势(T7 开盘确认0-3.5%)")
+    st_t8 = _stats(trend_t8, "右侧趋势(T8 组合叠加)")
+    st_t9 = _stats(trend_t9, "右侧趋势(T9 组合+温度门控)")
+    st2   = _stats(short_trades, "短线激进(线上现状)")
     st_sa = _stats(short_ea, "短线激进(新出场·最终形态)")
+    st_s5 = _stats(short_s5, "短线激进(S5 温度门控)")
     print("=" * 60)
     print("\n⚠️ 已知局限：候选池有幸存者偏差、数据为不复权K线、"
           "流通市值用成交额代理、短线用「冲板未封」近似原炸板池。结论仅供策略调优参考。")
@@ -568,14 +762,21 @@ def main():
     print("过去表现不代表未来收益。研究参考，不构成投资建议。")
 
     base = Path(__file__).resolve().parent.parent / "data"
-    for tr, nm in ((trend_trades, "回测_右侧趋势_线上现状"), (trend_fixed, "回测_右侧趋势_修复后"),
+    for tr, nm in ((trend_trades, "回测_右侧趋势_线上现状"),
+                   (trend_fixed, "回测_右侧趋势_修复后"),
                    (trend_v2, "回测_右侧趋势_新规则"),
+                   (trend_t6, "回测_右侧趋势_T6"),
+                   (trend_t7, "回测_右侧趋势_T7"),
+                   (trend_t8, "回测_右侧趋势_T8"),
+                   (trend_t9, "回测_右侧趋势_T9"),
                    (short_trades, "回测_短线激进_线上现状"),
-                   (short_ea, "回测_短线激进_新出场")):
+                   (short_ea, "回测_短线激进_新出场"),
+                   (short_s5, "回测_短线激进_S5")):
         if tr:
             pd.DataFrame(tr).to_csv(base / f"{nm}.csv", index=False, encoding="utf-8")
             print(f"明细已写入 data/{nm}.csv")
-    summ = [x for x in [st0, st1, st_tv2, st2, st_sa] if x]
+    summ = [x for x in [st0, st1, st_v2, st_t6, st_t7, st_t8, st_t9,
+                          st2, st_sa, st_s5] if x]
     if summ:
         pd.DataFrame(summ).to_csv(base / "回测_策略汇总.csv", index=False, encoding="utf-8")
     return 0
