@@ -508,7 +508,7 @@ def _value_score(symbol, quote=None, name=None, in_hot_board=False):
 
 def _extendable_score(meta=None, quote=None, in_hot_board=False, value_notes=None):
     """可展期分 0-20（独立显示，不计入主评分排名）
-    意义：满10天展期评估时的"底气分"——短线若未走完，该票是否有转中长期(≤30天)的支撑。
+    意义：满28天展期评估时的"底气分"——短线若未走完，该票是否有转中长期(≤60天)的支撑。
     评分项（共20分）：
     - 中期趋势 intact (5)：MA10>MA20>MA60 且现价>MA20
     - 行业持续性 (4)：属当日强势板块 / RPS 中期主线
@@ -1196,7 +1196,7 @@ def pick_trend_stocks(snapshot=None, boards=None, n=2, exclude_codes=None):
     8. RSI健康：RSI(14) 在 40-70 区间（不过热）
     9. 流通市值≥TREND_MIN_MARKET_CAP（30亿）
 
-    风控：止损-6%，止盈+6%/+10%，趋势完好可展期最长60天，目标2-4周。
+    风控：止损-6%，无固定止盈（破MA10移动止盈/破MA20结构止损，让利润奔跑），趋势完好满28天可展期最长60天，目标2-4周。
     """
     if not TREND_ENABLED:
         return []
@@ -1306,10 +1306,8 @@ def pick_trend_stocks(snapshot=None, boards=None, n=2, exclude_codes=None):
             low20 = recent20["最低"].min()
             buy_lo = round(max(low20, close * 0.98), 2)
             buy_hi = round(close * 1.01, 2)
-            # 趋势独立风控（修复 2026-09-08 bug：此前错误复用短线 -4%/+5%/+8%）
+            # 趋势独立风控（2026-09-14 变体B：去固定止盈，仅 -6% 止损 + MA10/MA20 跟踪，让利润奔跑）
             stop_loss = round(close * (1 + TREND_STOP_LOSS), 2)
-            tp1 = round(close * (1 + TREND_TAKE_PROFIT_1), 2)
-            tp2 = round(close * (1 + TREND_TAKE_PROFIT_2), 2)
             hold_min, hold_max = TREND_HOLD_DAYS
             signals = []
             if close > ma10 > ma20:
@@ -1330,7 +1328,7 @@ def pick_trend_stocks(snapshot=None, boards=None, n=2, exclude_codes=None):
                 "capital": None, "theme": None,
                 "buy": {
                     "基准价": round(close, 2),
-                    "止损价": stop_loss, "止盈1": tp1, "止盈2": tp2,
+                    "止损价": stop_loss, "止盈1": "", "止盈2": "",
                     "突破买点": buy_lo, "回踩买点": buy_hi,
                     "建议买价区间": f"{buy_lo}-{buy_hi}",
                 },

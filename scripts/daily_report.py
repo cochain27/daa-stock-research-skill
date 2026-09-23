@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """日报生成：完整日报 + 精简版推送文本"""
+import sys
 from datetime import datetime
 import pandas as pd
 from market_analysis import calc_market_temperature, safe_market_temperature, decide_position, single_stock_position, judge_market_env
@@ -11,8 +12,8 @@ from trend_tracker import log_picks as trend_log, analyze_track_pool as trend_an
 from short_tracker import log_picks as short_log, analyze_track_pool as short_analyze, roll_backtest
 from skill_bridge import get_sector_rps, get_stock_score, get_value_decision
 from config import (PUSH_DIR, REVIEW_DIR,
-                    STOP_LOSS, TAKE_PROFIT_1, TAKE_PROFIT_2,
                     SHORT_STOP_LOSS, SHORT_TAKE_PROFIT_1, SHORT_TAKE_PROFIT_2,
+                    TREND_STOP_LOSS,
                     TREND_ENABLED, TREND_MAX_PICKS, BOTTOM_FISHING_TEMP_MAX)
 
 # 低位埋伏候选（观察池）：收盘后扫描 T-1 蓄势候选，不作为买入推荐
@@ -22,34 +23,68 @@ try:
 except Exception:
     LOW_POS_ENTRY_ENABLED_REPORT = False
 
+# 温和放量初动池（第三策略）：只读缓存选股，K线更新由独立步骤负责
+try:
+    from warm_start_entry import pick_warm_start
+    WARM_START_ENABLED_REPORT = True
+except Exception:
+    WARM_START_ENABLED_REPORT = False
+
 
 def generate_full_report(temp, details, pos_advice, boards, picks, rps_rows=None, track_rows=None, track_overview=None,
                          market_env=None, env_desc=None, env_reason=None,
-                         low_pos_picks=None):
+                         low_pos_picks=None, warm_picks=None):
     """生成完整日报 markdown"""
     today = datetime.now().strftime("%Y-%m-%d")
     lines = []
-    env_tag = f"【{market_env}】" if market_env else ""
-    style_note = "右侧趋势2-4周（满14天可展期，≤2只，最长60天）｜短线激进3天（快进快出，-4%止损，+5%/+8%止盈）"
+    # 三池分组（速览与推荐个股共用；短线激进/右侧趋势为正式策略1、2，初动池为第3策略，低位埋伏为观察池）
+    short_list = [p for p in picks if _is_short(p)]
+    trend_list = [p for p in picks if _is_trend(p)]
+    band_list = [p for p in picks if p.get("strategy_tag") not in ("短线", "趋势")]  # 旧波段兼容
+    trend_all = trend_list or band_list
     lines.append(f"# 大A每日投研日报 {today}\n")
-    lines.append(f"> 生成时间：{datetime.now().strftime('%H:%M')} ｜ {env_tag} 风格：{style_note}\n")
 
-    # 市场温度 + 环境判定
-    lines.append("## 一、市场环境\n")
-    lines.append(f"**市场温度：{temp:.0f}/100**")
-    if market_env:
-        lines.append(f"**环境判定：{market_env}（{env_desc}）**")
-        lines.append(f"**判定依据：{env_reason}**")
-    lines.append(f"**仓位建议：{pos_advice[0]}**")
-    lines.append(f"**操作指引：{pos_advice[1]}**\n")
-    lines.append("| 维度 | 分值 | 说明 |")
-    lines.append("|------|------|------|")
-    for k, v in details.items():
-        lines.append(f"| {k} | {v['分']:.0f} | {v['说明']} |")
+    # —— 00 今日速览（首屏：温度+仓位+今日机会分池导读）——
+    lines.append("## 00 · 今日速览\n")
+    env_s = f"环境【{market_env}】｜ " if market_env else ""
+    lines.append(f"**市场温度：{temp:.0f}/100** ｜ {env_s}**仓位建议：{pos_advice[0]}**")
+    lines.append(f"{pos_advice[1]}\n")
+    lines.append("**今日机会**（三池分开列，均无推荐时合并提示）")
+    if picks:
+        if trend_all:
+            names = "、".join(f"{p['名称']}({p['symbol']})" for p in trend_all[:4])
+            lines.append(f"- 📈右侧趋势池 {len(trend_all)} 只：{names}（详情见 03）")
+        if short_list:
+            names = "、".join(f"{p['名称']}" for p in short_list[:4])
+            lines.append(f"- ⚡短线激进池 {len(short_list)} 只：{names}（详情见 03）")
+    if warm_picks:
+        names = "、".join(f"{w['名称']}({w['代码']})" for w in warm_picks[:4])
+        more = f" 等{len(warm_picks)}只" if len(warm_picks) > 4 else ""
+        lines.append(f"- 🔥初动池（第3策略）{len(warm_picks)} 只候选：{names}{more}（详情见 03）")
+    if not picks and not warm_picks:
+        lines.append("- 今日三池均无推荐/候选，观望为主")
     lines.append("")
 
+    # —— 01 市场环境（温度/仓位已在速览，此处只放判定依据与维度明细）——
+    lines.append("## 01 · 市场环境\n")
+    if market_env:
+        lines.append(f"**环境判定：{market_env}（{env_desc}）**")
+        lines.append(f"**判定依据：{env_reason}**\n")
+    # 维度表：数据不足的维度折叠为一行，避免占位噪音
+    _valid = {k: v for k, v in details.items()
+              if "数据不足" not in str(v.get("说明", "")) and "待补" not in str(v.get("说明", ""))}
+    _missing = [k for k in details if k not in _valid]
+    if _valid:
+        lines.append("| 维度 | 分值 | 说明 |")
+        lines.append("|------|------|------|")
+        for k, v in _valid.items():
+            lines.append(f"| {k} | {v['分']:.0f} | {v['说明']} |")
+        lines.append("")
+    if _missing:
+        lines.append(f"> 维度数据待补：{'、'.join(_missing)}（数据源暂缺，不影响温度主判定）\n")
+
     # 板块
-    lines.append("## 二、强势板块\n")
+    lines.append("## 02 · 强势板块\n")
     boards_preopen = boards is not None and not boards.empty and \
         pd.to_numeric(boards.get("涨跌幅"), errors="coerce").fillna(0).abs().sum() == 0
     if boards is not None and not boards.empty:
@@ -67,7 +102,7 @@ def generate_full_report(temp, details, pos_advice, boards, picks, rps_rows=None
             lead = str(lead) if pd.notna(lead) else "-"
             lines.append(f"| {name} | {chg} | {hs} | {lead} |")
     else:
-        lines.append("板块数据获取失败")
+        lines.append("> 今日板块数据缺失（数据源未返回），以盘中实际板块行情为准\n")
     lines.append("")
 
     # RPS中期相对强度（stock-researcher 交叉维度）
@@ -80,11 +115,8 @@ def generate_full_report(temp, details, pos_advice, boards, picks, rps_rows=None
         lines.append("> 当日涨幅榜看脉冲，RPS榜看中期主线——两者共振的板块优先级最高")
         lines.append("")
 
-    # 推荐个股（双策略：短线激进 + 右侧趋势）
-    short_list = [p for p in picks if _is_short(p)]
-    trend_list = [p for p in picks if _is_trend(p)]
-    band_list = [p for p in picks if p.get("strategy_tag") not in ("短线", "趋势")]  # 旧波段兼容
-    lines.append(f"## 三、推荐个股（{len(picks)}只）\n")
+    # 推荐个股（分池列出：右侧趋势池 / 短线激进池 / 温和放量初动池；编号连续）
+    lines.append(f"## 03 · 推荐个股（{len(picks)}只）\n")
     if not picks:
         lines.append("> ⚠️ **今日无合格推荐**：涨停剔除+行业去重后无达标标的，建议空仓观望或等待回调\n")
     else:
@@ -97,11 +129,21 @@ def generate_full_report(temp, details, pos_advice, boards, picks, rps_rows=None
             lines.append(f"> ⚠️ **短线通道质量提示**：全部情绪分<60，短线情绪不足，谨慎参与")
         if lines[-1].startswith("> ⚠️"):
             lines.append("")
-    for i, p in enumerate(picks, 1):
+    _pool_header_done = set()
+    # 2026-09-21 版面重构：推荐个股子池顺序调整为 趋势 → 短线（用户版面要求 (1)趋势 (2)短线）
+    ordered = trend_all + short_list
+    for i, p in enumerate(ordered, 1):
+        tag = p.get("strategy_tag", "波段")
+        pool_key = "短线" if tag == "短线" else "趋势"
+        if pool_key not in _pool_header_done:
+            _pool_header_done.add(pool_key)
+            n_pool = len(short_list) if pool_key == "短线" else len(trend_all)
+            # 2026-09-21 版面重构：子池带 (1)(2) 序号（用户版面要求 3推荐个股：(1)趋势 (2)短线）
+            pool_title = "(2) ⚡ 短线激进池（3天快进快出）" if pool_key == "短线" else "(1) 📈 右侧趋势池（2-4周波段）"
+            lines.append(f"### {pool_title}——{n_pool}只\n")
         price = p.get("现价")
         chg = p.get("涨跌幅")
         ind = p.get("行业")
-        tag = p.get("strategy_tag", "波段")
         tag_icon = "⚡短线" if tag == "短线" else ("📈趋势" if tag == "趋势" else "📈波段")
         lines.append(f"### {i}. {p['名称']}（{p['symbol']}） {tag_icon}")
         ind_s = f" ｜ 行业：{ind}" if ind else ""
@@ -126,7 +168,7 @@ def generate_full_report(temp, details, pos_advice, boards, picks, rps_rows=None
             lines.append(f"- 价值面：{p['value']}/30（{p.get('说明','')}）｜ 技术面：{p['tech']['分']}/30 ｜ 资金面：{p['capital']}/25 ｜ 题材：{p['theme']}/15")
             lines.append(f"- 技术说明：{p['tech']['说明']}")
         if tag == "波段" and p.get("可展期分") and p["可展期分"] >= 12 and p.get("可展期理由"):
-            lines.append(f"- 🟢 可展期依据：{'、'.join(p['可展期理由'])}（满10天未达波段目标时，若趋势+量能 intact 可申请展期，最长30天；展期后止盈升至 +10%/+15%）")
+            lines.append(f"- 🟢 可展期依据：{'、'.join(p['可展期理由'])}（满28天趋势+量能 intact 可申请展期，最长60天；展期后无固定止盈，继续 MA10 跟踪）")
         cv = p.get("交叉验证")
         if cv and cv.get("score") is not None:
             conf = f"{cv['confidence']*100:.0f}%" if isinstance(cv.get("confidence"), (int, float)) else "-"
@@ -150,17 +192,19 @@ def generate_full_report(temp, details, pos_advice, boards, picks, rps_rows=None
                 period_note = "目标3-5天，极限5天强制离场"
             else:
                 sl_note = "-6%止损"
-                tp_note = "+6%减半仓 / +10%清仓"
-                period_note = "满10天触发展期评估（趋势+量能 intact 可展期≤2只，最长30天）"
+                tp_note = "无固定止盈：破MA10移动止盈 / 破MA20结构止损（让利润奔跑）"
+                period_note = "满28天触发展期评估（趋势+量能 intact 可展期≤2只，最长60天）"
             lines.append("- 条件单建议：")
             lines.append(f"  - 突破买入（右侧优先）：≥ {b.get('突破买点','-')}")
             lines.append(f"  - 回踩买入（备用）：≤ {b.get('回踩买点','-')}")
             lines.append(f"  - 建议买价区间：{b.get('建议买价区间','-')}（**推荐即虚拟成交：按推荐时实时价入账**）")
             lines.append(f"  - 止损：{b.get('止损价','-')}（{sl_note}）")
-            lines.append(f"  - 止盈：{b.get('止盈1','-')}（{tp_note}）")
+            tp1_val = b.get('止盈1', '-')
+            tp_display = f"{tp1_val}（{tp_note}）" if tp1_val else tp_note
+            lines.append(f"  - 止盈：{tp_display}")
             lines.append(f"  - 周期：{period_note}")
             if tag == "波段" and p.get("可展期分") is not None and p["可展期分"] >= 12:
-                lines.append(f"  - 展期后备选：满10天趋势+量能 intact 可展期 → 目标升至 +10%/+15%，最长30天")
+                lines.append(f"  - 展期后备选：满28天趋势+量能 intact 可展期 → 无固定止盈，继续 MA10 跟踪，最长60天")
         lines.append("")
     # 组合分散提示
     inds = [p.get("行业") for p in picks if p.get("行业")]
@@ -171,27 +215,64 @@ def generate_full_report(temp, details, pos_advice, boards, picks, rps_rows=None
         else:
             lines.append(f"> ✅ 组合分散：推荐覆盖 {len(set(inds))} 个不同行业（{'、'.join(dict.fromkeys(inds))}），板块联动风险较低")
 
+    # 温和放量初动池（第3正式策略）—— 2026-09-20 升级：观察→正式策略，固化 V2 破MA5离场
+    # 2026-09-21 版面重构：初动池从独立 04 章并入「03 推荐个股」作为子池 (3)（用户版面要求）
+    lines.append("### (3) 温和放量初动池（第3策略）\n")
+    if not warm_picks:
+        lines.append("> 今日无满足最优档画像的初动票（缩量调整日量比普遍<1.3，属正常），可关注明日更新。\n")
+    else:
+        # 2026-09-23 版面调整：删除「周线上扬」列（策略筛选硬性条件，不再展示）
+        lines.append("| 股票 | 现价 | 量比 | 5日涨幅 | 60日位置 | 成交额 | 前10振幅 | 量能比 | 硬止损 |")
+        lines.append("|------|------|------|---------|----------|--------|----------|--------|------|")
+        for w in warm_picks[:8]:
+            lines.append(f"| {w['名称']}({w['代码']}) | {w['现价']:.2f} | {w['量比']:.2f}x | {w['5日涨幅%']:+.1f}% | {w['60日位置']:.0%} | {w['成交额亿']:.1f}亿 | {w['前10振幅%']:.1f}% | {w['量能比']:.2f} | {w['止损价']:.2f} |")
+        lines.append("")
+    # 持有中跟踪（跨日）—— 2026-09-23 与收盘复盘版面对齐：新增该子表 + 行业热度列
+    trows = []
+    try:
+        from strategy_notebook import warm_tracking_rows
+        from industry_heat_tool import stock_heat
+        trows = warm_tracking_rows(today)
+        if trows:
+            lines.append("**持有中跟踪**（T+n=距信号日交易日数；出场规则同上）\n")
+            lines.append("| 股票 | 行业热度 | 信号日 | 天数 | 现价 | 距信号 | 破MA5 | 建议 |")
+            lines.append("|------|----------|--------|------|------|--------|-------|------|")
+            for r in trows:
+                last_s = f"{r['现价']:.2f}" if r["现价"] is not None else "—"
+                dist_s = f"{r['距信号%']:+.1f}%" if r["距信号%"] is not None else "—"
+                days_s = f"T+{r['天数']}" if r["天数"] is not None else "—"
+                below_s = ("是" if r["破MA5"] else "否") if r["破MA5"] is not None else "—"
+                try:
+                    heat_s, _ = stock_heat(r["代码"], today)
+                except Exception:
+                    heat_s = "—"
+                lines.append(f"| {r['名称']} | {heat_s} | {r['信号日'][5:]} | {days_s} | {last_s} | {dist_s} | {below_s} | {r['建议']} |")
+            lines.append("")
+    except Exception as e:
+        print(f"[初动跟踪] 失败 {e}")
+    if warm_picks or trows:
+        lines.append("> **交易规则（V2 已固化，1366 样本回测）**：信号日收盘确认 → 次日开盘介入；**-8% 硬止损**（表内硬止损=现价×0.92）；持有 T+2 收盘起**收盘破 MA5 → 次日开盘离场**；**无固定止盈**（让利润奔跑）；最长持有 T+5 收盘强制离场。")
+        lines.append("> 口径：量比1.3-2.5+5日3-8%+位置<80%+站上MA20+MACD多头+周线共振+保守蓄势+成交额≤16亿；基线 T5 胜率 59.0%/均值+4.20%/盈亏比 3.07；V2 固化后盈亏比 4.46、最大亏 -12.3%→-9.3%（代价：胜率 -4.7pp）。大盘过滤已证伪（弱市信号更优），不设开闸条件。\n")
+
     # 低位埋伏候选池（观察池）—— 2026-09-12 新增
     # ⚠️ 本池为研究观察工具，非买入推荐。两路径并存（标准蓄势+近期超卖），仅供盘后复盘研究参考。
-    lines.append("## 三·低位埋伏候选池（观察）\n")
+    # 2026-09-21 版面重构：低位候选/连续追踪/风控提醒合并为「04 · 低位启动观察」三子段
+    lines.append("## 04 · 低位启动观察\n")
+    lines.append("### (1) 今日低位埋伏候选\n")
     if not low_pos_picks:
         lines.append("> 今日无低位埋伏候选（T-1 蓄势形态扫描结果）。\n")
     else:
-        lines.append("> ⚠️ **研究观察池**：两路径并存（标准蓄势+近期超卖），参数=量比2-7x+成交额4-16亿+涨幅9-15%+位置<55%；回测11只：大赚(T5≥10%)27%、大亏0%、T5均值+8.4%。**非买入推荐**，仅供盘后复盘研究参考。\n")
-        lines.append("| # | 名称 | 路径 | 蓄势特征 | 候选日 | 现价 | 60日位置 | 距高% | 量比 | 成交额亿 | 买点区间 | 止损 | 止盈1 |")
-        lines.append("|---|------|------|----------|--------|------|----------|-------|------|----------|----------|------|-------|")
+        lines.append("> ⚠️ **研究观察池**：两路径并存（标准蓄势+近期超卖），参数=量比2-7x+成交额4-16亿+涨幅9-15%+位置<55%；2024-04至今全历史回测428次触发：T5均值+3.4%、胜率52.7%、大赚(≥10%)19.5%、大亏(≤-10%)6.7%、8日止损触发12.9%。**非买入推荐**，仅供盘后复盘研究参考。\n")
+        lines.append("| # | 名称 | 路径 | 现价 | 60日位置 | 距高% | 量比 | 成交额亿 | 止损 |")
+        lines.append("|---|------|------|------|----------|-------|------|----------|------|")
         for i, p in enumerate(low_pos_picks, 1):
             path_icon = "📉超卖" if p.get("蓄势路径") == "近期超卖" else "📊蓄势"
-            feat = p.get("蓄势特征", "-")
-            date = p.get("日期", "-")
             close = p.get("现价", "-")
             pos60 = p.get("60日位置", "-")
             dist60 = p.get("dist60%", "-")
             lb = p.get("量比", "-")
             amt = p.get("成交额亿", "-")
-            buy_zone = p.get("买点区间", "-")
             sl = p.get("止损价", "-")
-            tp1 = p.get("止盈1", "-")
             try: close = f"{float(close):.2f}"
             except: pass
             try: pos60 = f"{float(pos60):.1%}"
@@ -204,23 +285,24 @@ def generate_full_report(temp, details, pos_advice, boards, picks, rps_rows=None
             except: pass
             try: sl = f"{float(sl):.2f}"
             except: pass
-            try: tp1 = f"{float(tp1):.2f}"
-            except: pass
-            lines.append(f"| {i} | {p['名称']}({p['代码']}) | {path_icon} | {feat} | {date} | {close} | {pos60} | {dist60} | {lb} | {amt} | {buy_zone} | {sl} | {tp1} |")
+            lines.append(f"| {i} | {p['名称']}({p['代码']}) | {path_icon} | {close} | {pos60} | {dist60} | {lb} | {amt} | {sl} |")
         lines.append("")
         lines.append("> 明日关注：若量比≥2.0x + 涨幅9-15% + 成交额4-16亿 + 突破MA20 → 可能触发买入信号（届时再做决策）\n")
 
     # 推荐跟踪池（连续跟踪分析）+ 虚拟净值
-    lines.append("## 四、推荐跟踪池（连续跟踪）\n")
+    lines.append("### (2) 连续追踪（推荐跟踪池）\n")
     if track_rows:
         ext_n = track_overview.get('展期数', 0)
-        ext_s = f"｜ 🟢展期中 {ext_n} 只（≤2只，最长30天）" if ext_n else ""
-        # 虚拟净值：双策略分开展示
+        ext_s = f"｜ 🟢展期中 {ext_n} 只（≤2只，最长60天）" if ext_n else ""
+        # 虚拟净值：双策略分开展示（仅渲染非空池，避免空池出现 "****" 占位）
         trend_nav = track_overview.get("趋势", {}).get("虚拟净值") or {}
         short_nav = track_overview.get("短线", {}).get("虚拟净值") or {}
-        trend_nav_s = f"趋势净值 {trend_nav.get('净值', 0):.0f}（{trend_nav.get('累计收益率', 0):+.2f}%）" if trend_nav else ""
-        short_nav_s = f"短线净值 {short_nav.get('净值', 0):.0f}（{short_nav.get('累计收益率', 0):+.2f}%）" if short_nav else ""
-        nav_s = f"｜ **{trend_nav_s}**" + (f"｜ **{short_nav_s}**" if short_nav_s else "")
+        nav_parts = []
+        if trend_nav:
+            nav_parts.append(f"**趋势净值 {trend_nav.get('净值', 0):.0f}（{trend_nav.get('累计收益率', 0):+.2f}%）**")
+        if short_nav:
+            nav_parts.append(f"**短线净值 {short_nav.get('净值', 0):.0f}（{short_nav.get('累计收益率', 0):+.2f}%）**")
+        nav_s = ("｜ " + "｜ ".join(nav_parts)) if nav_parts else ""
         lines.append(f"> 当前跟踪 **{track_overview.get('总只数', 0)} 只**，总盈亏 {track_overview.get('总盈亏', 0):+.1f}%（平均 {track_overview.get('平均盈亏', 0):+.1f}%）{ext_s}{nav_s}｜ {track_overview.get('建议', '')}\n")
         # 表格含止损/止盈字段（简洁展示）
         lines.append("| 名称 | 策略 | 推荐日 | 现价 | 累计% | 最高% | 止损 | 止盈1 | 止盈2 | 操作建议 |")
@@ -237,7 +319,7 @@ def generate_full_report(temp, details, pos_advice, boards, picks, rps_rows=None
             except: pass
             try: sl = f"{float(sl):.2f}"
             except: pass
-            lines.append(f"| {r['名称']}({r['代码']}) | {tag} | {r['推荐日']} | {r['现价']} | {r['累计盈亏%']:+.1f}% | {r['最高收益%']:+.1f}% | {sl} | {tp1} | {tp2} | {r['建议']} |")
+            lines.append(f"| {r['名称']} | {tag} | {r['推荐日']} | {r['现价']} | {r['累计盈亏%']:+.1f}% | {r['最高收益%']:+.1f}% | {sl} | {tp1} | {tp2} | {r['建议']} |")
         # 仓位预警
         try:
             sug_max = int(''.join(filter(str.isdigit, pos_advice[0].split('-')[-1])) or 0)
@@ -249,15 +331,20 @@ def generate_full_report(temp, details, pos_advice, boards, picks, rps_rows=None
     else:
         lines.append("> 当前无未结清推荐跟踪池。今日新推荐将自动入池，收盘后启动连续跟踪。\n")
 
-    lines.append("## 五、风控提醒")
-    lines.append("- **右侧趋势票**：止损 -6%；盈利>3% 上移成本线，跌破 MA10 移动止盈离场；+6% 减半 / +10% 清仓；满14日触发展期评估（趋势完好且展期≤2只可展期），展期后目标升至 +10%/+15%，最长60天强制离场")
-    lines.append("- **短线激进票**：止损 -4%；盈利>2% 上移成本线；+5% 减半 / +8% 清仓；目标3天，极限5天强制离场；每日重评情绪分，低于门槛剔除")
-    lines.append("- 横盘5日无进展建议移除；免责声明：本报告为研究参考，不构成投资建议")
+    lines.append("### (3) 风控提醒（列表）")
+    lines.append("- **右侧趋势票**：止损 -6%；收盘破 MA20 结构止损离场；破 MA10 移动止盈离场（无盈利门槛，让利润奔跑）；满28日触发展期评估（趋势+量能完好且展期≤2只可展期），展期后继续 MA10 跟踪，最长60天强制离场")
+    lines.append("- **短线激进票（新出场·2026-09-20 固化，1051 笔回测确认）**：止损 -5.5%；+5% 减半；减半后盈利>3% 收盘破 MA10 移动止盈清仓（无 +8% 止盈2）；满3天浮亏时间止损；极限5天强制离场；破MA5生命线离场；每日重评情绪分，低于门槛剔除")
+    lines.append("- **初动池票（第3策略）**：-8% 硬止损；持有 T+2 收盘起收盘破 MA5 → 次日开盘离场；无固定止盈让利润奔跑；最长 T+5 收盘强制离场（V2 已固化：回测盈亏比 3.07→4.46，最大亏 -12.3%→-9.3%）")
+    lines.append("")
+    lines.append("---")
+    lines.append("*免责声明：本报告为个人研究记录，不构成任何投资建议；市场有风险，据此操作风险自负。*")
+    lines.append("*数据说明：K线为腾讯前复权口径，盘前/节假日部分维度数据缺失时以已得数据为准；推荐即虚拟成交（按推荐时实时价入账）。*")
+    lines.append(f"*生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M')} ｜ 大A每日投研系统（三正式策略+一观察池）*")
     return "\n".join(lines)
 
 
 def generate_brief(temp, pos_advice, boards, picks, track_rows=None, track_overview=None, market_env=None,
-                   low_pos_picks=None):
+                   low_pos_picks=None, warm_picks=None):
     """精简版推送文本"""
     today = datetime.now().strftime("%m-%d")
     regime = pos_advice[1].split('：')[0] if '：' in pos_advice[1] else pos_advice[1]
@@ -278,9 +365,14 @@ def generate_brief(temp, pos_advice, boards, picks, track_rows=None, track_overv
         ext_s = ""
         if tag == "波段" and p.get("可展期分") is not None:
             ext_s = " 🟢" if p["可展期分"] >= 12 else " 🟡"
+        # 止盈展示：趋势票无固定止盈，短线段显示两档目标价
+        if tag == "短线":
+            tp_disp = f"止盈{b.get('止盈1','-')}/{b.get('止盈2','-')}"
+        else:
+            tp_disp = "止盈MA10跟踪/MA20结构止损"
         lines.append(f"{i}. {p['名称']}({p['symbol']}) {tag_s} 评分{p['total']:.0f}{cv_score}{ext_s} "
                      f"突破≥{b.get('突破买点','-')} 回踩≤{b.get('回踩买点','-')} "
-                     f"止损{b.get('止损价','-')} 止盈{b.get('止盈1','-')}/{b.get('止盈2','-')}")
+                     f"止损{b.get('止损价','-')} {tp_disp}")
     if track_rows:
         lines.append("跟踪池：")
         for r in track_rows:
@@ -302,6 +394,11 @@ def generate_brief(temp, pos_advice, boards, picks, track_rows=None, track_overv
         names = "、".join(f"{p['名称']}({p['代码']})" for p in low_pos_picks[:3])
         suffix = "…" if len(low_pos_picks) > 3 else ""
         lines.append(f"📍低位埋伏（观察）{len(low_pos_picks)}只：{names}{suffix}（⚠️研究工具非推荐）")
+    # 温和放量初动池（观察）—— 精简提示
+    if warm_picks:
+        wnames = "、".join(f"{w['名称']}" for w in warm_picks[:3])
+        wsuffix = "…" if len(warm_picks) > 3 else ""
+        lines.append(f"🔥初动池（观察）{len(warm_picks)}只：{wnames}{wsuffix}（⚠️研究工具非推荐）")
     return "\n".join(lines)
 
 
@@ -378,11 +475,27 @@ def run_daily():
     low_pos_picks = []
     if LOW_POS_ENTRY_ENABLED_REPORT:
         try:
-            low_pos_picks = pick_low_pos_entry(snapshot=snapshot, top=600, quiet=True)
+            low_pos_picks = pick_low_pos_entry(top=600, quiet=True)
+            # 2026-09-21 修低位池膨胀：剔除已在池（观察中）的老票，只保留今日新信号
+            from low_pos_entry import filter_active_pool
+            low_pos_picks = filter_active_pool(low_pos_picks)
             print(f"[低位埋伏] 候选 {len(low_pos_picks)} 只: {', '.join(p['名称'] for p in low_pos_picks[:5])}"
                   + (f"…等" if len(low_pos_picks) > 5 else ""))
         except Exception as e:
             print(f"[低位埋伏] 扫描失败（{e}），跳过")
+
+    # ===== 温和放量初动池扫描（第三策略观察池）—— 2026-09-20 新增，与收盘复盘一致 =====
+    warm_picks = []
+    if WARM_START_ENABLED_REPORT:
+        try:
+            warm_picks = pick_warm_start(top=600, update=False, quiet=True)
+            if warm_picks:
+                print(f"[初动池] 候选 {len(warm_picks)} 只: {', '.join(w['名称'] for w in warm_picks[:5])}"
+                      + ("…等" if len(warm_picks) > 5 else ""))
+            else:
+                print("[初动池] 今日无候选")
+        except Exception as e:
+            print(f"[初动池] 扫描失败（{e}），跳过")
 
     # ===== 发报前最后一步：强制刷新最新实时行情（推荐股现价/涨跌幅） =====
     refresh_codes = [p["symbol"] for p in picks if p.get("symbol")]
@@ -397,15 +510,19 @@ def run_daily():
                 if b.get("基准价"):
                     base = q["现价"]
                     is_short = p.get("strategy_tag") == "短线"
-                    sl_r = SHORT_STOP_LOSS if is_short else STOP_LOSS
-                    tp1_r = SHORT_TAKE_PROFIT_1 if is_short else TAKE_PROFIT_1
-                    tp2_r = SHORT_TAKE_PROFIT_2 if is_short else TAKE_PROFIT_2
                     b["突破买点"] = round(base * 1.02, 2)
                     b["回踩买点"] = round(min(base, base * 0.97), 2)
                     b["建议买价区间"] = f"{round(base * 0.97, 2)}-{round(base * 1.02, 2)}"
-                    b["止损价"] = round(base * (1 + sl_r), 2)
-                    b["止盈1"] = round(base * (1 + tp1_r), 2)
-                    b["止盈2"] = round(base * (1 + tp2_r), 2)
+                    if is_short:
+                        b["止损价"] = round(base * (1 + SHORT_STOP_LOSS), 2)
+                        b["止盈1"] = round(base * (1 + SHORT_TAKE_PROFIT_1), 2)
+                        # 新出场（2026-09-20 固化）：无 +8% 止盈2，减半后 MA10 移动止盈
+                        b["止盈2"] = ""
+                    else:
+                        # 右侧趋势：变体B 去固定止盈，仅 -6% 止损 + MA10/MA20 跟踪（原误复用 +6% 通用止盈）
+                        b["止损价"] = round(base * (1 + TREND_STOP_LOSS), 2)
+                        b["止盈1"] = ""
+                        b["止盈2"] = ""
 
     # 双策略分别落账（趋势入趋势台账，短线入短线台账；推荐即虚拟成交）
     try:
@@ -434,12 +551,18 @@ def run_daily():
     total_pnl = (trend_overview.get("总盈亏", 0) + short_overview.get("总盈亏", 0))
     avg_pnl = round(total_pnl / total, 1) if total else 0
     track_rows = trend_rows + short_rows
+
+    def _tag_advice(prefix, msg):
+        # 追踪器消息已自带策略前缀（如"趋势跟踪池为空"），避免重复拼接"趋势趋势"
+        msg = msg or "-"
+        return msg if msg.startswith(prefix) else f"{prefix}{msg}"
+
     track_overview = {
         # 兼容 generate_brief / generate_full_report 直接访问字段
         "总只数": total,
         "总盈亏": round(total_pnl, 1),
         "平均盈亏": avg_pnl,
-        "建议": f"趋势{trend_overview.get('建议', '-')}；短线{short_overview.get('建议', '-')}",
+        "建议": f"{_tag_advice('趋势', trend_overview.get('建议', '-'))}；{_tag_advice('短线', short_overview.get('建议', '-'))}",
         # 嵌套结构供 generate_full_report 双净值展示
         "趋势": trend_overview,
         "短线": short_overview,
@@ -447,9 +570,9 @@ def run_daily():
 
     full = generate_full_report(temp, details, pos_advice, boards, picks, rps_rows, track_rows, track_overview,
                                  market_env=market_env, env_desc=env_desc, env_reason=env_reason,
-                                 low_pos_picks=low_pos_picks)
+                                 low_pos_picks=low_pos_picks, warm_picks=warm_picks)
     brief = generate_brief(temp, pos_advice, boards, picks, track_rows, track_overview,
-                           market_env=market_env, low_pos_picks=low_pos_picks)
+                           market_env=market_env, low_pos_picks=low_pos_picks, warm_picks=warm_picks)
 
     # 风险日历排雷（2026-09-07 新增）：只提示不自动剔除，交由人工决策
     try:
@@ -473,13 +596,16 @@ def run_daily():
     path.write_text(full, encoding="utf-8")
     print(brief)
     print(f"\n[完整日报已保存] {path}")
-    # 微信推送完整日报
-    try:
-        from notify import push_report
-        ok, ch, msg = push_report(f"大A投研晨报 {today}", full)
-        print(f"[微信推送] {'成功' if ok else '跳过/失败: '+msg}")
-    except Exception:
-        pass
+    # 微信推送完整日报（--no-push 模式：仅选股登记，不推送——收盘复盘合一时用）
+    if "--no-push" not in sys.argv:
+        try:
+            from notify import push_report
+            ok, ch, msg = push_report(f"大A投研晨报 {today}", full)
+            print(f"[微信推送] {'成功' if ok else '跳过/失败: '+msg}")
+        except Exception:
+            pass
+    else:
+        print("[微信推送] 跳过（--no-push 模式，仅选股登记）")
     return full, brief
 
 

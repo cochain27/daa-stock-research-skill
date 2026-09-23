@@ -74,22 +74,58 @@ def _prev_day_change(idx_df):
     return (close.iloc[-1] / close.iloc[-2] - 1) * 100
 
 
+class _HardTimeout(Exception):
+    """SIGALRM 触发的硬超时，用于打断东财指数日线的多层重试挂起"""
+
+
+def _run_with_timeout(fn, seconds):
+    """在 seconds 秒内运行 fn，超时抛 _HardTimeout。
+    仅主线程可用（signal.alarm 限制）；非主线程直接运行不设限。"""
+    import threading
+    if threading.current_thread() is not threading.main_thread():
+        return fn()
+    import signal
+    old = signal.getsignal(signal.SIGALRM)
+
+    def _handler(signum, frame):
+        raise _HardTimeout()
+
+    signal.signal(signal.SIGALRM, _handler)
+    signal.alarm(seconds)
+    try:
+        return fn()
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old)
+
+
 def _prev_day_amount():
-    """东财指数日线取最近有效交易日两市成交额合计（亿元），失败返回0"""
+    """东财指数日线取最近有效交易日两市成交额合计（亿元），失败返回0。
+    东财指数日线在周末/限流时经 requests 多层重试可达 8 分钟挂起，
+    这里加 45s 硬超时，超时直接返回 0（下游 score_capital 给中性分）。"""
     import akshare as ak
-    total = 0.0
-    for sym in ("sh000001", "sz399001"):
-        try:
-            df = ak.stock_zh_index_daily_em(symbol=sym)
-            if df is None or df.empty or "amount" not in df.columns:
+
+    def _fetch():
+        total = 0.0
+        for sym in ("sh000001", "sz399001"):
+            try:
+                df = ak.stock_zh_index_daily_em(symbol=sym)
+                if df is None or df.empty or "amount" not in df.columns:
+                    continue
+                d = df[pd.to_numeric(df["volume"], errors="coerce").fillna(0) > 0]
+                if d.empty:
+                    continue
+                total += float(pd.to_numeric(d["amount"], errors="coerce").fillna(0).iloc[-1])
+            except _HardTimeout:
+                raise
+            except Exception:
                 continue
-            d = df[pd.to_numeric(df["volume"], errors="coerce").fillna(0) > 0]
-            if d.empty:
-                continue
-            total += float(pd.to_numeric(d["amount"], errors="coerce").fillna(0).iloc[-1])
-        except Exception:
-            continue
-    return total / 1e8
+        return total / 1e8
+
+    try:
+        return _run_with_timeout(_fetch, 45)
+    except Exception:
+        return 0.0
 
 
 def score_sentiment(snapshot, idx_sh=None):
@@ -173,9 +209,11 @@ def score_volume(snapshot):
 
 
 def score_capital():
-    """资金打分（0-100）——akshare北向数据不稳定时给中性分"""
+    """资金打分（0-100）——akshare北向数据不稳定时给中性分。
+    东财资金流在周末/限流时经 requests 多层重试可挂 5 分钟，
+    这里套 40s 硬超时，超时/失败快速返回中性分。"""
     try:
-        df = get_market_fund_flow()
+        df = _run_with_timeout(get_market_fund_flow, 40)
         if df is None or df.empty:
             return 50, "资金数据不可得(中性)"
         # df列可能为 日期/上证-涨跌幅/主力净流入-净额 等

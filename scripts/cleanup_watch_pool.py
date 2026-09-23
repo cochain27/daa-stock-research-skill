@@ -15,12 +15,15 @@ sys.path.insert(0, ".")
 
 from fetch_data import get_stock_hist
 from stock_screener import _tech_indicators
-from config import (LOW_POS_MAX_20D_AMP, LOW_POS_MAX_20D_STD, LOW_POS_MIN_DIST_60D_HIGH,
-                    LOW_POS_BEST_POS, LOW_POS_BEST_AMOUNT)
+from config import (LOW_POS_MAX_20D_AMP, LOW_POS_MAX_20D_STD)
 
 CSV_PATH = "../data/watch_history.csv"
-FIELDS = ["日期", "代码", "名称", "现价", "60日位置", "信号", "5日涨幅",
-          "行业", "买点区间", "止损价", "关注逻辑", "状态"]
+# 2026-09-16 修复：FIELDS 曾与实际 CSV 表头不一致（13列"信号/关注逻辑" vs
+# 实际12列"量比/蓄势路径"），--apply 重写会把"量比/蓄势路径"两列内容清空、
+# 造成历史数据丢失（9-13~9-16 曾因此丢过 9-10/9-11 归档行）。
+# 现在改为动态读取真实表头，只更新"状态"列，其余列原样保留。
+FIELDS = ["日期", "代码", "名称", "现价", "60日位置", "量比", "5日涨幅",
+          "行业", "买点区间", "止损价", "蓄势路径", "状态"]
 
 
 def check_stock(code):
@@ -42,16 +45,21 @@ def check_stock(code):
         v.append(f"振幅{amp20:.0%}≥15%")
     if std20 >= LOW_POS_MAX_20D_STD:
         v.append(f"std{std20:.0%}≥4%")
-    if dist60 <= LOW_POS_MIN_DIST_60D_HIGH:
-        v.append(f"距高{dist60:.0f}%≤-22%")
-    if not (LOW_POS_BEST_POS[0] <= pos < LOW_POS_BEST_POS[1]):
-        v.append(f"位置{pos:.0%}∉[{LOW_POS_BEST_POS[0]:.0%},{LOW_POS_BEST_POS[1]:.0%})")
     return (v, pos, amp20, std20, dist60, None)
 
 
 def main():
     apply = "--apply" in sys.argv
     rows = list(csv.DictReader(open(CSV_PATH, encoding="utf-8")))
+    # 动态读真实表头：若与预期 FIELDS 不一致（历史曾发生列错位导致重写丢数据），
+    # 仅做体检，拒绝写盘，杜绝再次整表损坏。
+    if not rows:
+        print("CSV 为空或表头缺失，终止。")
+        return
+    real_fields = list(rows[0].keys())
+    if real_fields != FIELDS:
+        print(f"[安全保护] 实际表头 {real_fields} ≠ 预期 {FIELDS}，拒绝执行，请先人工修复 CSV 表头。")
+        return
     latest = max(r["日期"] for r in rows)
     pool = [r for r in rows if r["日期"] == latest]
 

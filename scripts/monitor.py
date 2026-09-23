@@ -105,8 +105,10 @@ def run_monitor():
         tag_icon = "⚡短线" if tag == "短线" else ("🟢展期" if extended else "📈波段")
         if stop and price <= stop:
             checks.append(("止损", f"⛔ 跟踪池 {name}({code}) {tag_icon} 现价{price} 跌破止损{stop}，移除跟踪"))
-        if tp2 and price >= tp2:
-            pct = "+15%" if extended else ("+8%" if tag == "短线" else "+10%")
+        # 止盈2告警：短线策略 2026-09-20「新出场」固化后无 +8% 清仓档（台账旧值不再触发），
+        # 仅展期/波段票保留
+        if tp2 and price >= tp2 and tag != "短线":
+            pct = "+15%" if extended else "+10%"
             checks.append(("止盈2", f"💰 跟踪池 {name}({code}) {tag_icon} 现价{price} 达止盈2 {tp2}（{pct}），清仓移除"))
         if tp1 and price >= tp1:
             pct = "+10%" if extended else ("+5%" if tag == "短线" else "+6%")

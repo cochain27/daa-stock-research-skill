@@ -12,9 +12,8 @@ from pathlib import Path
 import pandas as pd
 from fetch_data import get_realtime_quotes
 from config import (
-    TRACK_TREND_PATH, STOP_LOSS, TAKE_PROFIT_1, TAKE_PROFIT_2,
-    HOLD_DAYS_MAX, HOLD_DAYS_QUIT, EXTEND_MAX_DAYS, EXTEND_MAX_COUNT,
-    EXTEND_TP1, EXTEND_TP2, EXTEND_PEAK_DRAWBACK,
+    TRACK_TREND_PATH, TREND_STOP_LOSS,
+    EXTEND_PEAK_DRAWBACK,
     TREND_HOLD_DAYS, TREND_EXTEND_MAX_DAYS, TREND_EXTEND_MAX_COUNT,
     VIRTUAL_ENABLED, VIRTUAL_BASE, ALLOW_CODE_PREFIX,
 )
@@ -24,15 +23,15 @@ from tracker_common import (
     check_virtual_settled,
 )
 
-OPEN_STATUS = ("持有中", "止盈1减半", "展期中")
+OPEN_STATUS = ("持有中", "止盈1减半", "展期中")  # "止盈1减半"保留以兼容历史台账，变体B不再新产生该状态
 STRATEGY_TAG = "趋势"
-TP1, TP2, SL = TAKE_PROFIT_1, TAKE_PROFIT_2, STOP_LOSS
-MAX_DAYS = HOLD_DAYS_MAX
-EXT_MAX = TREND_EXTEND_MAX_DAYS
+SL = TREND_STOP_LOSS                # -6% 硬止损（变体B：保留）
+MAX_DAYS = TREND_HOLD_DAYS[1]       # 28 天到期/展期触发（变体B，原误用 HOLD_DAYS_MAX=10）
+EXT_MAX = TREND_EXTEND_MAX_DAYS     # 60 天展期硬上限
 
-# 趋势策略展期配置
+# 趋势策略展期配置（变体B：满 28 天趋势完好可展期至 60 天，展期后无固定止盈，继续 MA10 跟踪）
 TREND_EXTEND_CFG = {
-    "HOLD_DAYS_MAX": HOLD_DAYS_MAX,
+    "HOLD_DAYS_MAX": TREND_HOLD_DAYS[1],
     "EXTEND_MAX_DAYS": TREND_EXTEND_MAX_DAYS,
     "EXTEND_MAX_COUNT": TREND_EXTEND_MAX_COUNT,
     "EXTEND_PEAK_DRAWBACK": EXTEND_PEAK_DRAWBACK,
@@ -113,9 +112,6 @@ def update_track():
         if q.get("最高", -1) == 0 or price <= 0:
             continue  # 停牌
         is_extended = r["状态"] == "展期中" or "展期" in (r.get("备注") or "")
-        tp1r = EXTEND_TP1 if is_extended else TP1
-        tp2r = EXTEND_TP2 if is_extended else TP2
-        max_days = EXTEND_MAX_DAYS if is_extended else MAX_DAYS
 
         try:
             base = float(r["基准价"])
@@ -128,14 +124,12 @@ def update_track():
         r["最高收益%"] = str(round(hi, 2))
         r["最后更新"] = today
 
-        tp1_target = base * (1 + tp1r)
-        tp2_target = base * (1 + tp2r)
         days = (datetime.strptime(today, "%Y-%m-%d") - datetime.strptime(r["日期"], "%Y-%m-%d")).days
 
-        # 技术面破坏检测（第2天起）
+        # 技术面破坏检测（第2天起）：变体B = 破MA20结构止损 + 破MA10移动止盈（无盈利门槛）
         tech_broken, tech_reason = tech_break(r, price, mode="trend") if days >= 1 else (False, "")
 
-        # 止损
+        # 变体B出场优先级：①-6%止损 ②技术面(MA20/MA10) ③展期硬上限 ④满28天展期评估
         if price <= sl:
             r["状态"] = "止损出局"
             r["备注"] = f"触发{int(abs(SL)*100)}%止损(峰值{hi:+.1f}%)"
@@ -145,26 +139,13 @@ def update_track():
             r["状态"] = "技术离场"
             r["备注"] = f"技术面破坏:{tech_reason}(收益{ret:+.1f}%)"
             record_settlement(r, vtrade, price, "技术面破坏离场")
-        # 止盈2
-        elif price >= tp2_target:
-            tag = "展期" if is_extended else ""
-            r["状态"] = "止盈2清仓"
-            r["备注"] = f"{tag}达+{tp2r*100:.0f}%目标(峰值{hi:+.1f}%)"
-            record_settlement(r, vtrade, price, f"{tag}止盈2清仓")
-        # 止盈1
-        elif price >= tp1_target:
-            if r["状态"] != "止盈1减半":
-                r["状态"] = "止盈1减半"
-                r["备注"] = f"{'展期' if is_extended else ''}达+{tp1r*100:.0f}%减半仓"
-            else:
-                r["备注"] = f"减半后持有中(峰值{hi:+.1f}%)"
         # 展期硬上限
         elif is_extended and days >= EXT_MAX:
             r["状态"] = "到期离场"
             r["备注"] = f"满{EXT_MAX}天展期硬上限,收益{ret:+.1f}%"
             record_settlement(r, vtrade, price, "展期到期离场")
         # 满目标天数 → 展期评估
-        elif days >= max_days and not is_extended:
+        elif days >= MAX_DAYS and not is_extended:
             can_ext, reason = extend_decision(r, price, ret, peak, ext_count, TREND_EXTEND_CFG)
             if can_ext:
                 r["状态"] = "展期中"
@@ -172,13 +153,8 @@ def update_track():
                 ext_count += 1
             else:
                 r["状态"] = "到期离场"
-                r["备注"] = f"满{max_days}天,{reason},收益{ret:+.1f}%"
+                r["备注"] = f"满{MAX_DAYS}天,{reason},收益{ret:+.1f}%"
                 record_settlement(r, vtrade, price, "到期离场")
-        # 横盘5天无进展
-        elif days >= HOLD_DAYS_QUIT and ret < 3:
-            r["状态"] = "到期离场"
-            r["备注"] = f"横盘{days}天无进展离场,收益{ret:+.1f}%"
-            record_settlement(r, vtrade, price, "横盘离场")
         updated += 1
 
     _write_rows(TRACK_TREND_PATH, rows, _ledger_fields())
@@ -214,9 +190,6 @@ def analyze_track_pool():
         price = q.get("现价", 0)
         name = r["名称"]
         is_extended = r["状态"] == "展期中" or "展期" in (r.get("备注") or "")
-        tp1r = EXTEND_TP1 if is_extended else TP1
-        tp2r = EXTEND_TP2 if is_extended else TP2
-        max_days = EXTEND_MAX_DAYS if is_extended else MAX_DAYS
 
         try:
             base = float(r["基准价"])
@@ -245,8 +218,6 @@ def analyze_track_pool():
         total_pnl += ret
 
         tech_broken, tech_reason = tech_break(r, price, mode="trend") if days >= 1 else (False, "")
-        target_tp1 = round(base * (1 + tp1r), 2)
-        target_tp2 = round(base * (1 + tp2r), 2)
 
         advice = ""
         flag = "✅"
@@ -258,46 +229,31 @@ def analyze_track_pool():
             advice = f"⛔ 技术面破坏：{tech_reason}，剔除跟踪池"
             flag = "⛔"
             stop_count += 1
-        elif price >= target_tp2:
-            advice = f"💰 达止盈2 {target_tp2:.2f}（+{tp2r*100:.0f}%），清仓移除"
-            flag = "💰"
-        elif price >= target_tp1:
-            if r["状态"] == "止盈1减半":
-                advice = f"💰 已减半，余仓看 {target_tp2:.2f}（+{tp2r*100:.0f}%）"
-            else:
-                advice = f"💰 达止盈1 {target_tp1:.2f}（+{tp1r*100:.0f}%），建议减半仓"
-            flag = "💰"
         elif is_extended and days >= EXT_MAX:
             advice = f"⛔ 满 {EXT_MAX} 天展期硬上限，强制离场（收益 {ret:+.1f}%）"
             flag = "⛔"
-        elif days >= max_days and not is_extended:
+        elif days >= MAX_DAYS and not is_extended:
             can_ext, reason = extend_decision(r, price, ret, peak, ext_count, TREND_EXTEND_CFG)
             if can_ext:
-                advice = f"📅 满 {max_days} 天，{reason}；展期后目标升至 +{EXTEND_TP1*100:.0f}%/+{EXTEND_TP2*100:.0f}%"
+                advice = f"📅 满 {MAX_DAYS} 天，{reason}；展期后继续 MA10 跟踪，最长 {EXT_MAX} 天"
                 flag = "🟢"
             else:
-                advice = f"📅 满 {max_days} 天，{reason}，建议到期离场移除"
+                advice = f"📅 满 {MAX_DAYS} 天，{reason}，建议到期离场移除"
                 flag = "📅"
-        elif days >= HOLD_DAYS_QUIT and ret < 3:
-            advice = f"⚠️ 持有 {days} 天无进展（{ret:+.1f}%），横盘离场"
-            flag = "⚠️"
-        elif ret >= 3:
-            advice = f"✅ 盈利 +{ret:.1f}%，移动止损上移至成本线；目标 +{tp1r*100:.0f}%/+{tp2r*100:.0f}%"
+        elif ret >= 0:
+            advice = f"✅ 持有 {ret:+.1f}%，破 MA10 移动止盈离场、破 MA20 结构止损（变体B让利润奔跑）"
             flag = "✅"
-        elif ret < 0:
-            advice = f"⚠️ 浮亏 {ret:.1f}%，止损位 {sl:.2f} 必须挂上"
-            flag = "⚠️"
         else:
-            advice = f"✅ 微利 {ret:.1f}%，持有观察"
-            flag = "✅"
+            advice = f"⚠️ 浮亏 {ret:.1f}%，止损位 {sl:.2f} 必须挂上；破 MA10/MA20 离场"
+            flag = "⚠️"
 
         analyzed.append({
             "名称": name, "代码": code, "推荐日": r["日期"], "策略标签": STRATEGY_TAG,
             "持有天数": days, "基准价": base, "现价": price,
             "当日涨跌%": q.get("涨跌幅"), "累计盈亏%": round(ret, 2),
             "最高收益%": round(peak, 2), "状态": r["状态"], "展期": is_extended,
-            "止损价": sl, "止盈1": target_tp1, "止盈2": target_tp2,
-            "更新止损": sl, "更新止盈1": target_tp1, "更新止盈2": target_tp2,
+            "止损价": sl, "止盈1": "", "止盈2": "",
+            "更新止损": sl, "更新止盈1": "", "更新止盈2": "",
             "建议": advice, "标记": flag,
             "横盘天数": r.get("横盘天数", ""),
             "突破类型": r.get("突破类型", ""),

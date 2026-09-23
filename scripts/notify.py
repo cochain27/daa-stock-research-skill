@@ -203,96 +203,44 @@ def _render_pick_card(d):
 
 
 def _render_low_pos_summary():
-    """低位埋伏策略统计摘要 → 概览卡"""
+    """低位埋伏策略统计摘要 → 概览卡（读 data/低位埋伏_统计.json，缺文件时提示未回测）"""
+    import os as _os
+    stats_path = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
+                               "data", "低位埋伏_统计.json")
+    try:
+        s = json.loads(open(stats_path, encoding="utf-8").read())
+        rows_html = (
+            f'<tr>'
+            f'<td class="rt-lab">回测窗口</td><td colspan="5"><b>{s["窗口"]}（{s["样本数"]}次触发/{s["票数"]}只）</b></td>'
+            f'</tr>'
+            f'<tr>'
+            f'<td class="rt-lab">T5均值</td><td><b class="{"up" if (s["T5均值"] or 0) > 0 else "dn"}">{s["T5均值"]:+.2f}%</b></td>'
+            f'<td class="rt-lab">T5胜率</td><td><b>{s["T5胜率"]:.1f}%</b></td>'
+            f'<td class="rt-lab">止损触发</td><td><b>{s["止损触发率"]:.0f}%</b></td>'
+            f'</tr>'
+            f'<tr>'
+            f'<td class="rt-lab">T5大赚(≥10%)</td><td><b class="up">{s["T5大赚率"]:.0f}%</b></td>'
+            f'<td class="rt-lab">T5大亏(≤-10%)</td><td><b>{s["T5大亏率"]:.0f}%</b></td>'
+            f'<td class="rt-lab">T3均值</td><td><b>{s["T3均值"]:+.2f}%</b></td>'
+            f'</tr>'
+            f'<tr>'
+            f'<td class="rt-lab">温度≥55子样本</td><td colspan="5"><b>{s["闸门开样本"]}次 · T5均值{s["闸门开T5均值"]:+.2f}% · 胜率{s["闸门开T5胜率"]:.0f}%</b></td>'
+            f'</tr>'
+        )
+        warn = "⚠️ 观察池：标准蓄势+近期超卖双路径，触发=次日量比2-7x+涨幅9-15%+成交额4-16亿；非买入推荐，仅供复盘研究参考"
+    except Exception:
+        rows_html = '<tr><td class="rt-lab">回测状态</td><td colspan="5"><b>统计待生成（跑 low_pos_backtest_full.py）</b></td></tr>'
+        warn = "⚠️ 观察池：非买入推荐，仅供复盘研究参考"
     return (
         '<div class="rt-card">'
-        '<div class="rt-card-h">📊 低位埋伏策略统计（60只触发票·两路径并存）</div>'
+        '<div class="rt-card-h">📊 低位埋伏策略统计（2024至今·本地K线全历史回测）</div>'
         '<div class="rt-card-b">'
-        '<table class="rt-grid">'
-        '<tr>'
-        '<td class="rt-lab">蓄势位置</td><td><b>&lt;55%</b></td>'
-        '<td class="rt-lab">触发涨幅</td><td><b>9-15%</b></td>'
-        '<td class="rt-lab">触发量比</td><td><b>2.0-7x</b></td>'
-        '</tr>'
-        '<tr>'
-        '<td class="rt-lab">触发成交额</td><td colspan="5"><b>4-16亿（16亿以下0大亏）</b></td>'
-        '</tr>'
-        '<tr>'
-        '<td class="rt-lab">大赚T5≥10%</td><td><b class="up">27%</b></td>'
-        '<td class="rt-lab">大亏T5≤-10%</td><td><b>0%</b></td>'
-        '<td class="rt-lab">T5均值</td><td><b class="up">+8.4%</b></td>'
-        '</tr>'
-        '</table>'
-        '<div class="rt-warn">⚠️ 两路径并存（标准蓄势+近期超卖），核心目标提高转化率；11只样本，仅供复盘参考，非买入推荐</div>'
+        f'<table class="rt-grid">{rows_html}</table>'
+        f'<div class="rt-warn">{warn}</div>'
         '</div></div>'
     )
 
 
-def _render_low_pos_card(picks):
-    """低位埋伏候选 → 股票信息卡（手机端友好，非普通表格行）"""
-    if not picks:
-        return ""
-    cards = []
-    for p in picks:
-        name = p.get("名称", "?")
-        code = p.get("代码", "?")
-        path = p.get("蓄势路径", "标准蓄势")
-        path_icon = "📉" if path == "近期超卖" else "📊"
-        path_label = "超卖反弹" if path == "近期超卖" else "标准蓄势"
-
-        # 核心指标
-        pos60 = p.get("60日位置", "-")
-        try: pos60 = f"{float(pos60):.0%}"
-        except: pass
-        dist60 = p.get("dist60%", "-")
-        try: dist60 = f"{float(dist60):+.0f}%"
-        except: pass
-        lb = p.get("量比", "-")
-        try: lb = f"{float(lb):.2f}x"
-        except: pass
-        chg5 = p.get("5日涨幅%", "-")
-        try: chg5 = f"{float(chg5):+.1f}%"
-        except: pass
-        amp20 = p.get("20日振幅%", "-")
-        try: amp20 = f"{float(amp20):.0f}%"
-        except: pass
-        amt = p.get("成交额亿", "-")
-        try: amt = f"{float(amt):.1f}亿"
-        except: pass
-        feat = p.get("蓄势特征", "-")
-        buy_zone = p.get("买点区间", "-")
-        sl = p.get("止损价", "-")
-        try: sl = f"{float(sl):.2f}"
-        except: pass
-        ind = p.get("行业", "")
-
-        # 行业标签
-        ind_tag = f'<span class="rt-pill">{ind}</span>' if ind else ""
-
-        cards.append(
-            f'<div class="rt-card">'
-            f'<div class="rt-card-h">'
-            f'{path_icon} {name} <span class="rt-code">{code}</span>'
-            f'<span class="rt-badge">{path_label}</span>'
-            f'</div>'
-            f'<div class="rt-card-b">'
-            f'<table class="rt-grid">'
-            f'<tr><td class="rt-lab">60日位置</td><td><b>{pos60}</b></td>'
-            f'<td class="rt-lab">距高</td><td>{dist60}</td></tr>'
-            f'<tr><td class="rt-lab">量比</td><td>{lb}</td>'
-            f'<td class="rt-lab">5日涨幅</td><td>{chg5}</td></tr>'
-            f'<tr><td class="rt-lab">20日振幅</td><td>{amp20}</td>'
-            f'<td class="rt-lab">成交额</td><td>{amt}</td></tr>'
-            f'</table>'
-            f'<div class="rt-tech">{feat}</div>'
-            f'<table class="rt-grid" style="margin-top:3px">'
-            f'<tr><td class="rt-lab">买区</td><td><b>{buy_zone}</b></td>'
-            f'<td class="rt-lab">止损</td><td class="dn">{sl}</td></tr>'
-            f'</table>'
-            f'{ind_tag}'
-            f'</div></div>'
-        )
-    return "".join(cards)
 
 
 def _inline(text):
@@ -334,30 +282,13 @@ def md_to_mobile_html(md):
                     else:
                         out.append(f'<div class="rt-item">{_inline(" | ".join(r))}</div>')
                 continue
-            # 低位埋伏候选池表格 → 卡片样式
+            # 低位埋伏候选池表格 → 通用表格渲染（2026-09-21 用户要求：卡片太长且字段错位显示空，
+            # 改回紧凑表格；表头由 daily_report 控制在 9 列以内）
             is_low_pos_table = "蓄势路径" in headers or ("路径" in headers and "候选" in "".join(headers))
             # 在低位池章节，第一个候选表前插入统计摘要卡
             if in_low_pos_section and not low_pos_summary_done and is_low_pos_table:
                 out.append(_render_low_pos_summary())
                 low_pos_summary_done = True
-            if is_low_pos_table:
-                parsed_picks = []
-                for row in rows:
-                    if len(row) >= 6:
-                        pick = {}
-                        for ci, h in enumerate(headers):
-                            if ci < len(row):
-                                pick[h] = row[ci]
-                        name_code = row[headers.index("名称")] if "名称" in headers else (row[1] if len(row) > 1 else "")
-                        m = re.match(r"(.+?)（(\d{6})）", str(name_code))
-                        if m:
-                            pick["名称"] = m.group(1)
-                            pick["代码"] = m.group(2)
-                        if pick.get("名称") and pick.get("名称") != "名称":
-                            parsed_picks.append(pick)
-                if parsed_picks:
-                    out.append(_render_low_pos_card(parsed_picks))
-                    continue
             html = ["<table><tr>"] + [f"<th>{_inline(h)}</th>" for h in headers] + ["</tr>"]
             for r in rows:
                 html.append("<tr>" + "".join(f"<td>{_inline(c)}</td>" for c in r) + "</tr>")

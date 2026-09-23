@@ -69,7 +69,7 @@ def _get_open_price(code, date_str):
     if sub.empty:
         return None, None
     row = sub.iloc[0]
-    return row["开盘"], row["日期"]
+    return row["开盘"], pd.to_datetime(row["日期"]).strftime("%Y-%m-%d")
 
 
 def _next_trading_day(date_str, offset):
@@ -83,7 +83,7 @@ def _next_trading_day(date_str, offset):
     sub = df[df["日期_dt"] > target]
     if len(sub) < offset:
         return None
-    return sub.iloc[offset - 1]["日期"]
+    return pd.to_datetime(sub.iloc[offset - 1]["日期"]).strftime("%Y-%m-%d")
 
 
 def log_picks(picks, market_env=None):
@@ -217,7 +217,9 @@ def update_track():
             continue  # 停牌
         try:
             base = float(r["基准价"])
-            sl = float(r["止损"]) if r["止损"] else base * (1 + SHORT_SL)
+            # 新出场固化(2026-09-20)：统一按基准价重算 -5.5%，与 monitor/daily_report 口径一致
+            # （台账旧票的"止损"列可能是 -4% 时代写入的失真值）
+            sl = base * (1 + SHORT_SL)
         except (ValueError, TypeError):
             continue
         ret = (price / base - 1) * 100
@@ -233,7 +235,10 @@ def update_track():
         # 技术面破坏检测（第2天起）
         tech_broken, tech_reason = tech_break(r, price, mode="short") if days >= 1 else (False, "")
 
-        # 止损
+        # 判定顺序：止损 → 技术面破坏 → 时间止损 → 硬上限 → 止盈1
+        # 关键修复(2026-09-19)：时间止损/硬上限必须在止盈1分支之前，
+        # 否则"止盈1减半"票价格≥tp1时永远命中止盈分支，到期离场/时间止损永不触发，
+        # 票会无限期滞留池中（如宝鼎科技 9-11 建仓 9-18 仍"止盈1减半"、持有7天>5天上限）。
         if price <= sl:
             r["状态"] = "止损出局"
             r["备注"] = f"触发{int(abs(SHORT_SL)*100)}%止损(峰值{hi:+.1f}%)"
@@ -243,6 +248,16 @@ def update_track():
             r["状态"] = "技术离场"
             r["备注"] = f"技术面破坏:{tech_reason}(收益{ret:+.1f}%)"
             record_settlement(r, vtrade, price, "技术面破坏离场")
+        # 时间止损（持有≥3天仍浮亏，快刀离场）
+        elif SHORT_TIME_STOP_DAYS > 0 and days >= SHORT_TIME_STOP_DAYS and ret < 0:
+            r["状态"] = "时间止损"
+            r["备注"] = f"满{SHORT_TIME_STOP_DAYS}天仍浮亏{ret:+.1f}%，时间止损"
+            record_settlement(r, vtrade, price, "时间止损")
+        # 硬上限（短线持股不超过1周，满 SHORT_MAX 天了结——含"止盈1减半"剩余仓位）
+        elif days >= SHORT_MAX:
+            r["状态"] = "到期离场"
+            r["备注"] = f"短线满{SHORT_MAX}天硬上限,收益{ret:+.1f}%"
+            record_settlement(r, vtrade, price, "短线到期离场")
         # 止盈1（减半后剩余仓位走移动止损，不再 +8% 一次性清仓——2026-09-09 改造）
         elif price >= tp1_target:
             if r["状态"] != "止盈1减半":
@@ -250,16 +265,6 @@ def update_track():
                 r["备注"] = f"达+{SHORT_TP1*100:.0f}%减半仓，剩余仓位移动止损(MA10)"
             else:
                 r["备注"] = f"减半后持有中(峰值{hi:+.1f}%)"
-        # 时间止损（2026-09-09：持有≥3天仍浮亏，等待成本高于快刀）
-        elif SHORT_TIME_STOP_DAYS > 0 and days >= SHORT_TIME_STOP_DAYS and ret < 0:
-            r["状态"] = "时间止损"
-            r["备注"] = f"满{SHORT_TIME_STOP_DAYS}天仍浮亏{ret:+.1f}%，时间止损"
-            record_settlement(r, vtrade, price, "时间止损")
-        # 3天硬上限（短线持股不超过1周，按回测逻辑3天了结）
-        elif days >= SHORT_MAX:
-            r["状态"] = "到期离场"
-            r["备注"] = f"短线满{SHORT_MAX}天硬上限,收益{ret:+.1f}%"
-            record_settlement(r, vtrade, price, "短线到期离场")
         updated += 1
 
     _write_rows(TRACK_SHORT_PATH, rows, _short_ledger_fields())
@@ -295,7 +300,8 @@ def analyze_track_pool():
 
         try:
             base = float(r["基准价"])
-            sl = float(r["止损"]) if r["止损"] else base * (1 + SHORT_SL)
+            # 新出场固化(2026-09-20)：统一按基准价重算 -5.5%（同 update_track）
+            sl = base * (1 + SHORT_SL)
         except (ValueError, TypeError):
             continue
 
@@ -332,17 +338,14 @@ def analyze_track_pool():
             advice = f"⛔ 技术面破坏：{tech_reason}，剔除跟踪池"
             flag = "⛔"
             stop_count += 1
-        elif price >= target_tp2:
-            advice = f"💰 达止盈2 {target_tp2:.2f}（+{SHORT_TP2*100:.0f}%），清仓移除"
-            flag = "💰"
         elif price >= target_tp1:
-            advice = f"💰 达止盈1 {target_tp1:.2f}（+{SHORT_TP1*100:.0f}%），建议减半仓"
+            advice = f"💰 达止盈1 {target_tp1:.2f}（+{SHORT_TP1*100:.0f}%），建议减半仓；剩余仓位盈利>3%收盘破MA10清仓"
             flag = "💰"
         elif days >= SHORT_MAX:
             advice = f"⛔ 短线满{SHORT_MAX}天，强制离场（收益 {ret:+.1f}%）"
             flag = "⛔"
         elif ret >= 2:
-            advice = f"✅ 盈利 +{ret:.1f}%，止损上移至成本线；目标 +{SHORT_TP1*100:.0f}%/+{SHORT_TP2*100:.0f}%"
+            advice = f"✅ 盈利 +{ret:.1f}%，目标 +{SHORT_TP1*100:.0f}% 减半；减半后盈利>3%收盘破MA10清仓（无 +8% 止盈2）"
             flag = "✅"
         elif ret < 0:
             advice = f"⚠️ 浮亏 {ret:.1f}%，止损位 {sl:.2f} 必须挂上"

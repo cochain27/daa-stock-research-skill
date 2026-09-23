@@ -5,6 +5,27 @@
   两条路径并存、互不矛盾，核心目标 = 提高"所选股票的转化率"（7日内真拉升概率），而非池子大：
   · 标准蓄势路径 = 低估价值票调整后启动（位置中等偏低 + 缩量横盘后放量启动）
   · 近期超卖路径 = 超跌反弹修复（近期曾极度超卖，反弹途中温和放量）
+
+2026-09-23 入池标准温和版收紧（用户拍板；依据 18279 去重事件全历史回放，low_pos_tighten_study2.py）：
+  · 扫描端成交额上限 15亿→6亿（双路径同步）：12-15亿档 60日启动率仅 0.2%，大票被触发线
+    「启动日成交 4-16亿」结构性卡死；2-4亿档最优 4.6%
+  · 扫描端 pos60 上限 0.55→0.40（新增 SCAN_POS60_MAX，双路径同步；触发端 MAX_POS60=0.55 不动）：
+    >0.40 档 5日启动仅 0.1%/中位 31 天
+  · 效果：60日启动率 3.15%→5.20%，5日启动 0.61%→1.34%，启动中位 16→12 交易日，
+    启动后 T5 +3.1%→+3.4%（胜率 51.5%→52.8%），日均入池约 32→13 只
+  · 激进版（再加 dist60≤-30：60日启动 10.35%）未采纳，池子日均仅 2 只、胜率 -3pct，暂缓
+
+2026-09-23 晚 两连拍板（A → A+宽），依据 low_pos_factor_sweep.py 地毯式验证 + 18279 事件回放：
+  · A：超卖路径扫描端加「蓄势日距高≤-25%」（LOW_POS_ENTRY_OS_SCAN_DIST60_MAX）。
+    温和版内距高>-25 的 4386 事件（全部来自超卖反弹段）10日启动仅 1.44%，是最大拖累项；
+    标准蓄势路径本就有 MIN_DIST60=-25，故仅补齐超卖路径。10日 2.46%→4.01%
+  · A+宽：双路径扫描端再加「MA20乖离≥-5%」（LOW_POS_ENTRY_SCAN_BIAS20_MIN，标准路径
+    在 _蓄势通过、超卖路径在 OS_SCAN 段）。企稳确认逻辑：深跌25%+且收复MA20=距发动最近，
+    深埋MA20下方=下跌中继。四指标全面改善：10日 4.01%→5.32%（基线2.2倍）、60日 9.55%、
+    启动后 T5 +4.29%、胜率 54.2%（反超基线 52.8%）；最近15日实测日均 7.2→6.3只（-12%）
+  · A+紧（MA20乖离(-5,3]）10日更高 6.07% 但 T5 降至 3.36%，未采纳
+  · 分年稳健：A+宽 10日启动 2024/2025/2026 = 3.77/5.55/5.76% 单调走强
+
   关键数据结论（隔离"大票"混杂因子后）：
   · 大亏票（T5≤-10%）成交额全部 ≥20.9亿 → 成交额是最强区分因子，16亿以下 0 大亏
   · 大赚票（T5≥+10%）量比 2.04~3.05，3/4 落在 2.0~2.5 → 量比下界 2.5 误杀，应放宽到 2.0
@@ -48,6 +69,8 @@ import requests
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from config import (LOW_POS_ENTRY_ENABLED, LOW_POS_ENTRY_MAX_POS60,
+                    LOW_POS_ENTRY_SCAN_POS60_MAX,
+                    LOW_POS_ENTRY_SCAN_BIAS20_MIN,
                     LOW_POS_ENTRY_MIN_DIST60, LOW_POS_ENTRY_MAX_LB5,
                     LOW_POS_ENTRY_MAX_LB5_MEAN, LOW_POS_ENTRY_CHG5_RANGE,
                     LOW_POS_ENTRY_MAX_CHG_TODAY,
@@ -56,11 +79,25 @@ from config import (LOW_POS_ENTRY_ENABLED, LOW_POS_ENTRY_MAX_POS60,
                     LOW_POS_ENTRY_TRIGGER_LB_MAX,
                     LOW_POS_ENTRY_TRIGGER_CHG_MIN, LOW_POS_ENTRY_TRIGGER_CHG_MAX, LOW_POS_ENTRY_TRIGGER_BREAK_MA20,
                     LOW_POS_ENTRY_STOP_LOSS, LOW_POS_ENTRY_TP1, LOW_POS_ENTRY_TP2,
+                    LOW_POS_ENTRY_HOLD_DAYS,
                     LOW_POS_ENTRY_TRIGGER_MIN_AMOUNT, LOW_POS_ENTRY_TRIGGER_MAX_AMOUNT,
                     LOW_POS_ENTRY_TEMP_MIN, LOW_POS_ENTRY_BOARD_RESONANCE,
                     LOW_POS_ENTRY_RECENT_OVERSOLD_LOOKBACK,
                     LOW_POS_ENTRY_RECENT_OVERSOLD_POS60_MAX,
-                    LOW_POS_ENTRY_RECENT_OVERSOLD_DIST_MAX)
+                    LOW_POS_ENTRY_RECENT_OVERSOLD_DIST_MAX,
+                    LOW_POS_ENTRY_OS_SCAN_AMOUNT_RANGE,
+                    LOW_POS_ENTRY_OS_SCAN_POS60_MAX,
+                    LOW_POS_ENTRY_OS_SCAN_DIST60_MAX,
+                    LOW_POS_ENTRY_OS_SCAN_OS_AGE_MIN,
+                    LOW_POS_ENTRY_OS_SCAN_LB_MAX,
+                    LOW_POS_ENTRY_OS_SCAN_LB5MEAN_MAX,
+                    LOW_POS_ENTRY_OS_SCAN_CHG5_MAX,
+                    LOW_POS_ENTRY_OS_TRIGGER_LB, LOW_POS_ENTRY_OS_TRIGGER_LB_MAX,
+                    LOW_POS_ENTRY_OS_TRIGGER_CHG_MIN, LOW_POS_ENTRY_OS_TRIGGER_CHG_MAX,
+                    LOW_POS_ENTRY_OS_TRIGGER_MIN_AMOUNT, LOW_POS_ENTRY_OS_TRIGGER_MAX_AMOUNT,
+                    LOW_POS_ENTRY_OS_TRIGGER_BREAK_MA20,
+                    LOW_POS_ENTRY_OS_STOP_LOSS, LOW_POS_ENTRY_OS_TP1, LOW_POS_ENTRY_OS_TP2,
+                    LOW_POS_ENTRY_OS_HOLD_DAYS)
 from fetch_data import get_market_snapshot, get_realtime_quotes
 from stock_screener import ALLOW_CODE_PREFIX, MAX_SAME_INDUSTRY
 
@@ -158,30 +195,40 @@ def _indicators(df):
 # 返回 (是否近期超卖, 超卖日, 超卖时pos60, 超卖时dist60)
 
 def _recent_oversold(ind_df, cur_idx):
-    """检查 ind_df[0:cur_idx) 区间内是否有超卖信号（pos60<0.5 or dist60<-30%）。"""
+    """检查 ind_df[0:cur_idx) 区间内是否有超卖信号（pos60<0.5 or dist60<-30%）。
+    返回 (是否近期超卖, 首次超卖日, 超卖时pos60, 超卖时dist60, 首次超卖idx)。"""
     lookback = LOW_POS_ENTRY_RECENT_OVERSOLD_LOOKBACK
     start = max(0, cur_idx - lookback)
     window = ind_df.iloc[start:cur_idx]
-    for _, row in window.iterrows():
+    for idx, row in window.iterrows():
         p60 = row.get("pos60")
         d60 = row.get("dist60")
         if p60 is not None and p60 < 0.5:
-            return True, str(pd.Timestamp(row["日期"]).date()), p60, d60
+            return True, str(pd.Timestamp(row["日期"]).date()), p60, d60, idx
         if d60 is not None and d60 < LOW_POS_ENTRY_RECENT_OVERSOLD_DIST_MAX:
-            return True, str(pd.Timestamp(row["日期"]).date()), p60, d60
-    return False, None, None, None
+            return True, str(pd.Timestamp(row["日期"]).date()), p60, d60, idx
+    return False, None, None, None, None
 
 
 # ---------------- 蓄势候选（T-1 扫描，全A） ----------------
 
 def _蓄势通过(row):
-    """T-1 收盘状态的五条蓄势判据（v3 共性研究）"""
+    """T-1 收盘状态的八项蓄势判据（v3 共性研究 + 09-23 A+宽/V6' 演进）
+    pos60 / 距高 / MA20乖离 / 量比 / 5日涨幅 / 候选日涨幅 / 振幅 / 成交额"""
     if pd.isna(row.get("pos60")) or pd.isna(row.get("dist60")):
         return False, "指标不足"
-    if row["pos60"] >= LOW_POS_ENTRY_MAX_POS60:
-        return False, f"位置{row['pos60']:.0%}≥{LOW_POS_ENTRY_MAX_POS60:.0%}"
+    if row["pos60"] >= LOW_POS_ENTRY_SCAN_POS60_MAX:
+        return False, f"位置{row['pos60']:.0%}≥{LOW_POS_ENTRY_SCAN_POS60_MAX:.0%}"
     if row["dist60"] > LOW_POS_ENTRY_MIN_DIST60:
         return False, f"距高点{row['dist60']:.0f}%>-{abs(LOW_POS_ENTRY_MIN_DIST60):.0f}%"
+    # 2026-09-23 晚 A+宽：MA20乖离 ≥-5%（用户拍板）。企稳确认逻辑：深跌25%+且股价
+    #   收复到 MA20 附近 = 止跌企稳，距发动最近（10日启动5.32%/胜率54.2%，双超基线）；
+    #   深埋 MA20 下方 = 下跌中继（10日仅2.32%）。双路径扫描端统一，与回测口径一致。
+    _ma20 = row.get("MA20")
+    if _ma20 is not None and not pd.isna(_ma20):
+        _bias20 = (float(row["收盘"]) / float(_ma20) - 1) * 100
+        if _bias20 < LOW_POS_ENTRY_SCAN_BIAS20_MIN:
+            return False, f"MA20乖离{_bias20:.1f}%<-5%（未企稳，下跌中继）"
     lb = row.get("lb")
     lbm = row.get("lb5mean")
     if pd.isna(lb) or pd.isna(lbm):
@@ -204,6 +251,33 @@ def _蓄势通过(row):
     return True, "ok"
 
 
+def _layered_candidates(snap, top):
+    """2026-09-23 V6 分层候选池（修复 top 截断漏抓小票，康强电子根因）。
+
+    旧逻辑：快照按成交额降序 head(top) —— 晨报/复盘调用 top=600，收盘后 600 名门槛
+    约 6-8 亿，判据主战场 2-6 亿小票被结构性排除（低位首板票中位额 4.1 亿、康强
+    3.39 亿被挡）。新规则：
+      ① 主战场 2-6 亿段全保（超限按额升序截断——最小票是旧逻辑最先牺牲的）；
+      ② <2 亿段按额降序补一半剩余名额（盘前时点实时额不可靠，留通道）；
+      ③ ≥6 亿段按额降序补足剩余（判据会淘汰，纯占位兜底）。
+    总量 cap = max(top, 1200)，K线请求成本较 top=600 最多翻倍、较 1500 不增。
+    """
+    cap = max(top, 1200)
+    inband = snap[snap["_amt"].between(LOW_POS_ENTRY_MIN_AMOUNT, LOW_POS_ENTRY_MAX_AMOUNT - 1e-9)]
+    below_all = snap[snap["_amt"] < LOW_POS_ENTRY_MIN_AMOUNT].sort_values("_amt", ascending=False)
+    big_all = snap[snap["_amt"] >= LOW_POS_ENTRY_MAX_AMOUNT].sort_values("_amt", ascending=False)
+    if len(inband) > cap:
+        inband = inband.sort_values("_amt").head(cap)
+    rest = cap - len(inband)
+    below = below_all.head(rest // 2)
+    big = big_all.head(rest - len(below))
+    if len(big) < rest - len(below):  # big 段不满额（如盘前 below 独大），名额回落给 below
+        below = below_all.head(rest - len(big))
+    out = pd.concat([inband, below, big], ignore_index=True)
+    print(f"[候选池] 分层：2-6亿 {len(inband)} / <2亿 {len(below)} / ≥6亿 {len(big)}，共 {len(out)}（cap={cap}）")
+    return out
+
+
 def pick_low_pos_entry(as_of=None, top=1500, quiet=False):
     """主策略函数：T-1 收盘扫描全A，返回蓄势候选列表（含指标）。
 
@@ -222,7 +296,7 @@ def pick_low_pos_entry(as_of=None, top=1500, quiet=False):
     snap = snap[snap["代码"].str.match(r"^(?:" + "|".join(ALLOW_CODE_PREFIX) + ")", na=False)]
     snap = snap[~snap["名称"].astype(str).str.contains("ST|退", na=False)]
     snap["_amt"] = pd.to_numeric(snap.get("成交额"), errors="coerce").fillna(0)
-    snap = snap.sort_values("_amt", ascending=False).head(top)
+    snap = _layered_candidates(snap, top)  # 2026-09-23 V6 分层候选池，替代 head(top) 截断
     codes = snap["代码"].tolist()
     names = dict(zip(snap["代码"], snap["名称"].astype(str)))
 
@@ -256,31 +330,85 @@ def pick_low_pos_entry(as_of=None, top=1500, quiet=False):
         ok, why = _蓄势通过(row)
         # 如果标准蓄势失败，检查是否属于"近期超卖"路径
         recent_os = False
-        os_date, os_pos60, os_dist60 = None, None, None
+        os_date, os_pos60, os_dist60, os_first_idx = None, None, None, None
         if not ok:
-            recent_os, os_date, os_pos60, os_dist60 = _recent_oversold(ind, len(ind) - 1)
+            # 2026-09-21 对齐：窗口改为含 T-1 行本身（原 len(ind)-1 漏掉蓄势日，
+            # 与 backtest() 的 _recent_oversold(ind, i+1) 口径不一致 → 回测统计失真）
+            recent_os, os_date, os_pos60, os_dist60, os_first_idx = _recent_oversold(ind, len(ind))
         if not ok and not recent_os:
             continue
         # 候选日自身涨幅过滤（双路径统一，防追已启动票）
         chg_today = float(row.get("涨跌幅") or 0)
         if chg_today > LOW_POS_ENTRY_MAX_CHG_TODAY:
             continue  # 候选日已大涨，不追
-        # 标准蓄势通过：pos60上限0.55x；近期超卖路径：pos60上限0.65x
-        pos60_max = (LOW_POS_ENTRY_MAX_POS60 if ok else LOW_POS_ENTRY_RECENT_OVERSOLD_POS60_MAX)
+        # 标准蓄势通过：扫描端 pos60 上限 0.40（09-23 温和版）；近期超卖路径：扫描端同样 0.40（OS_SCAN）
+        pos60_max = (LOW_POS_ENTRY_SCAN_POS60_MAX if ok else LOW_POS_ENTRY_RECENT_OVERSOLD_POS60_MAX)
         pos60_val = float(row["pos60"])
         if pos60_val >= pos60_max:
             continue  # 双路径都不满足上限
+        # ---- 2026-09-21 超卖路径扫描段收紧（防池子膨胀，研究定案见 config）----
+        #   只作用于超卖路径候选入池；标准蓄势路径不受影响。
+        if recent_os:
+            amt_lo, amt_hi = LOW_POS_ENTRY_OS_SCAN_AMOUNT_RANGE
+            amt = float(row.get("成交额") or 0)
+            if not (amt_lo <= amt <= amt_hi):
+                continue  # 蓄势日成交额出界（巨头票纯占池）
+            if pos60_val >= LOW_POS_ENTRY_OS_SCAN_POS60_MAX:
+                continue  # 蓄势日位置过高（0.55-0.65 区间触发样本=0）
+            # 2026-09-23 A方案提速：蓄势日距60日高点须 ≤-25%（用户拍板）。
+            #   依据：温和版内距高>-25 的 4386 事件全部来自超卖反弹段，10日启动仅1.44%
+            #   拖累整体（2.46%）；加此后 10日 4.01%、日均 16.2→6.5只、胜率-3pct。
+            #   标准蓄势路径已有 LOW_POS_ENTRY_MIN_DIST60=-25，此处仅补齐超卖路径。
+            if float(row.get("dist60") or 0) > LOW_POS_ENTRY_OS_SCAN_DIST60_MAX:
+                continue  # 反弹已收复超25%跌幅，距发动远（10日启动率仅1.44%）
+            # 2026-09-23 A+宽：超卖路径同样要求 MA20乖离 ≥-5%（与 _蓄势通过 口径一致）
+            _os_ma20 = row.get("MA20")
+            if _os_ma20 is not None and not pd.isna(_os_ma20):
+                _os_bias = (float(row["收盘"]) / float(_os_ma20) - 1) * 100
+                if _os_bias < LOW_POS_ENTRY_SCAN_BIAS20_MIN:
+                    continue  # 深埋MA20下方=下跌中继（10日启动2.32%且T5弱）
+            os_age = len(ind) - 1 - os_first_idx  # 距首次超卖交易日数
+            if os_first_idx is not None and os_age < LOW_POS_ENTRY_OS_SCAN_OS_AGE_MIN:
+                continue  # 新进超卖（≤9日）反弹前夜，样本胜率33%均值-1.96%
+            lb_val = float(row.get("lb") or 0)
+            if lb_val > LOW_POS_ENTRY_OS_SCAN_LB_MAX:
+                continue  # 蓄势日量比过大（反弹前夜已爆量=不追）
+            lbm_val = float(row.get("lb5mean") or 0)
+            if lbm_val > LOW_POS_ENTRY_OS_SCAN_LB5MEAN_MAX:
+                continue  # 5日量比均值过大（大亏50%）
+            c5_val = float(row.get("chg5") or 0)
+            if c5_val > LOW_POS_ENTRY_OS_SCAN_CHG5_MAX:
+                continue  # 已反弹段（5日>0），样本胜率48%均值+2.21%；底部段更优
         close = float(row["收盘"])
         ma20 = float(row["MA20"]) if not pd.isna(row["MA20"]) else close
         buy_lo = round(close * 0.99, 2)
         buy_hi = round(close * 1.03, 2)
         if recent_os:
             path_label = "近期超卖"
-            feat = (f"超卖修复{row['pos60']:.0%}/{os_date} pos60{os_pos60:.0%}"
+            feat = (f"超卖修复{row['pos60']:.0%}/{os_date} pos60 {os_pos60:.0%}"
                     if os_pos60 else f"超卖修复{row['pos60']:.0%}/{os_date}")
         else:
             path_label = "标准蓄势"
             feat = f"缩量{row['lb']:.2f}x/低位{row['pos60']:.0%}/距高{row['dist60']:.0f}%/横盘5日"
+        # 止盈止损按路径分流：近期超卖用固化 OS_* 参数，标准蓄势用 TRIGGER 同族参数
+        if recent_os:
+            _stop_loss, _tp1, _tp2, _hold_days = (LOW_POS_ENTRY_OS_STOP_LOSS,
+                                      LOW_POS_ENTRY_OS_TP1, LOW_POS_ENTRY_OS_TP2,
+                                      LOW_POS_ENTRY_OS_HOLD_DAYS)
+        else:
+            _stop_loss, _tp1, _tp2, _hold_days = (LOW_POS_ENTRY_STOP_LOSS,
+                                      LOW_POS_ENTRY_TP1, LOW_POS_ENTRY_TP2,
+                                      LOW_POS_ENTRY_HOLD_DAYS)
+        # 2026-09-16 修复：止损锚定从「候选日收盘价」改为「买区上沿」。
+        #   旧逻辑止损=收盘×(1-8%)，而买区下限=收盘×0.99，区间内买入后
+        #   价格仅回落 ~1% 就触及止损（通鼎：买区21.03-22.89、止损20.89，
+        #   21.03买入→-0.7%即止损），低位横盘票单日振幅±4-6%，静态止损
+        #   完全给不出洗盘空间。新逻辑止损=买区上沿×(1-8%)，在区间内任意
+        #   位置买入，止损距离都≥8%，给足正常震荡空间。
+        _stop_price = round(buy_hi * (1 + _stop_loss), 2)
+        # 启动信号触发线（观察池用）：放量突破 买区上沿 → 触发介入提示
+        #   仅用于观察池跟踪提示（close_review 连续追踪段），不参与 T-1 选股。
+        _trigger_line = round(buy_hi, 2)
         picks.append({
             "代码": code, "名称": names.get(code, code),
             "日期": str(pd.Timestamp(row["日期"]).date()),
@@ -294,10 +422,11 @@ def pick_low_pos_entry(as_of=None, top=1500, quiet=False):
             "成交额亿": round(float(row.get("成交额") or 0) / 1e8, 2),
             "MA20": round(ma20, 2),
             "买点区间": f"{buy_lo}-{buy_hi}",
-            "止损价": round(close * (1 + LOW_POS_ENTRY_STOP_LOSS), 2),
-            "止盈1": round(close * (1 + LOW_POS_ENTRY_TP1), 2),
-            "止盈2": round(close * (1 + LOW_POS_ENTRY_TP2), 2),
-            "操作计划": "触发后买入，T+3止盈（均价法）",
+            "止损价": _stop_price,
+            "触发线": _trigger_line,
+            "止盈1": round(close * (1 + _tp1), 2),
+            "止盈2": round(close * (1 + _tp2), 2),
+            "操作计划": f"触发后买入，T+{_hold_days}止盈（均价法）",
             "蓄势路径": path_label,        # "标准蓄势" 或 "近期超卖"
             "超卖日": os_date,             # 若近期超卖，记录超卖发生日
             "超卖时位置": round(float(os_pos60), 3) if os_pos60 else None,
@@ -321,6 +450,36 @@ def pick_low_pos_entry(as_of=None, top=1500, quiet=False):
     return picks
 
 
+# ---------------- 观察池去重（2026-09-21 修低位池膨胀） ----------------
+
+def filter_active_pool(picks):
+    """剔除已在观察池在册（最新状态=观察中）的票。
+
+    背景（2026-09-21）：09-21 单日入池 22 只，其中宁德/兆易/东财/烽火等 4 只
+    早在 09-15~09-17 已在池，仍每日重刷「今日候选」——此前 close_review 只
+    排除了短线/趋势跟踪池（track_rows），从未排除低位池自己在册的票。
+    规则：最新状态=「观察中」→ 剔除（老票只进连续追踪段）；
+          「已失效」（T+5 超时/止损移出）→ 允许重新入池（新信号）。
+    """
+    import csv as _csv
+    path = DATA_DIR / "watch_history.csv"
+    if not path.exists() or not picks:
+        return picks
+    latest = {}
+    try:
+        with path.open(encoding="utf-8") as f:
+            for r in _csv.DictReader(f):
+                c = (r.get("代码") or "").strip()
+                if c:
+                    latest[c] = (r.get("状态") or "").strip()
+    except Exception:
+        return picks
+    active = {c for c, st in latest.items() if st == "观察中"}
+    if not active:
+        return picks
+    return [p for p in picks if str(p.get("代码", "")) not in active]
+
+
 # ---------------- T 日触发（实时盘口） ----------------
 
 def check_launch_trigger(cands, quiet=False):
@@ -339,23 +498,40 @@ def check_launch_trigger(cands, quiet=False):
         price = r["现价"]; chg = r.get("涨跌幅", 0); lb = r.get("量比", 0)
         amt = r.get("成交额", 0)
         ma20 = c["MA20"]
+        # 触发参数按路径分流：近期超卖用固化 OS_*，标准蓄势用 TRIGGER 同族参数
+        if c.get("蓄势路径") == "近期超卖":
+            _lb_lo = LOW_POS_ENTRY_OS_TRIGGER_LB
+            _chg_lo = LOW_POS_ENTRY_OS_TRIGGER_CHG_MIN
+            _chg_hi = LOW_POS_ENTRY_OS_TRIGGER_CHG_MAX
+            _amt_lo = LOW_POS_ENTRY_OS_TRIGGER_MIN_AMOUNT
+            _amt_hi = LOW_POS_ENTRY_OS_TRIGGER_MAX_AMOUNT
+            _break_ma20 = LOW_POS_ENTRY_OS_TRIGGER_BREAK_MA20
+            _hold_days = LOW_POS_ENTRY_OS_HOLD_DAYS
+        else:
+            _lb_lo = LOW_POS_ENTRY_TRIGGER_LB
+            _chg_lo = LOW_POS_ENTRY_TRIGGER_CHG_MIN
+            _chg_hi = LOW_POS_ENTRY_TRIGGER_CHG_MAX
+            _amt_lo = LOW_POS_ENTRY_TRIGGER_MIN_AMOUNT
+            _amt_hi = LOW_POS_ENTRY_TRIGGER_MAX_AMOUNT
+            _break_ma20 = LOW_POS_ENTRY_TRIGGER_BREAK_MA20
+            _hold_days = LOW_POS_ENTRY_HOLD_DAYS
         reasons = []
-        if lb >= LOW_POS_ENTRY_TRIGGER_LB:
+        if lb >= _lb_lo:
             reasons.append(f"量比{lb:.1f}x")
-        if LOW_POS_ENTRY_TRIGGER_CHG_MIN <= chg <= LOW_POS_ENTRY_TRIGGER_CHG_MAX:
+        if _chg_lo <= chg <= _chg_hi:
             reasons.append(f"涨幅{chg:+.1f}%✓")
         elif chg > 0:
             reasons.append(f"涨幅{chg:+.1f}%(不足)")
-        if amt >= LOW_POS_ENTRY_TRIGGER_MIN_AMOUNT:
+        if amt >= _amt_lo:
             reasons.append(f"成交额{amt/1e8:.1f}亿")
-        if LOW_POS_ENTRY_TRIGGER_BREAK_MA20 and price > ma20:
+        if _break_ma20 and price > ma20:
             reasons.append("破MA20")
         if not reasons:
             continue
-        # 需同时满足：量比 + 涨幅(9-15%甜区) + 成交额三重确认
-        if not (lb >= LOW_POS_ENTRY_TRIGGER_LB
-                and LOW_POS_ENTRY_TRIGGER_CHG_MIN <= chg <= LOW_POS_ENTRY_TRIGGER_CHG_MAX
-                and LOW_POS_ENTRY_TRIGGER_MIN_AMOUNT <= amt <= LOW_POS_ENTRY_TRIGGER_MAX_AMOUNT):
+        # 需同时满足：量比 + 涨幅(甜区) + 成交额三重确认
+        if not (lb >= _lb_lo
+                and _chg_lo <= chg <= _chg_hi
+                and _amt_lo <= amt <= _amt_hi):
             continue
         hits.append({
             "代码": c["代码"], "名称": c["名称"],
@@ -364,7 +540,7 @@ def check_launch_trigger(cands, quiet=False):
             "MA20": ma20, "触发": "+".join(reasons),
             "买点区间": c["买点区间"], "止损价": c["止损价"],
             "止盈1": c["止盈1"], "止盈2": c["止盈2"],
-            "操作计划": "T+3 快速止盈（均价法）",
+            "操作计划": f"T+{_hold_days} 快速止盈（均价法）",
             "蓄势日": c["日期"], "蓄势位置": c["60日位置"],
             "买入逻辑": f"{c['名称']}低位蓄势({c['日期']}入选)后放量启动：{'+'.join(reasons)}，"
                         f"距60日高{c['dist60%']:.0f}%，买点{c['买点区间']}，止损{c['止损价']}",
@@ -384,9 +560,10 @@ def _next_trading_days(ind, anchor_date, n=5):
     return after.iloc[0], after.iloc[1:].head(n).to_dict("records")
 
 
-def backtest(top=600, days=120, min_trigger=1, codes=None):
+def backtest(top=600, days=120, min_trigger=1, codes=None, names_map=None):
     """对最近 days 天内的每个蓄势日，检查次日是否触发，统计 T+N 收益。
-    codes: 显式代码列表（绕开快照限流）；None 时走全市场快照 top 只。"""
+    codes: 显式代码列表（绕开快照限流）；None 时走全市场快照 top 只。
+    names_map: {code: 名称}（显式 codes 时补名称，供行业共振判断）"""
     if codes is None:
         snap = get_market_snapshot()
         if snap is None or snap.empty:
@@ -397,11 +574,11 @@ def backtest(top=600, days=120, min_trigger=1, codes=None):
         snap = snap[snap["代码"].str.match(r"^(?:" + "|".join(ALLOW_CODE_PREFIX) + ")", na=False)]
         snap = snap[~snap["名称"].astype(str).str.contains("ST|退", na=False)]
         snap["_amt"] = pd.to_numeric(snap.get("成交额"), errors="coerce").fillna(0)
-        snap = snap.sort_values("_amt", ascending=False).head(top)
+        snap = _layered_candidates(snap, top)  # 2026-09-23 V6 与生产口径一致，修复回测缺小票
         codes = snap["代码"].tolist()
         names = dict(zip(snap["代码"], snap["名称"].astype(str)))
     else:
-        names = {c: c for c in codes}
+        names = dict(names_map) if names_map else {c: c for c in codes}
     print(f"[回测] 拉取 {len(codes)} 只K线（{days}天）...", flush=True)
     hists = {}
     with ThreadPoolExecutor(max_workers=WORKERS) as ex:
@@ -412,12 +589,31 @@ def backtest(top=600, days=120, min_trigger=1, codes=None):
                 hists[c] = h
     print(f"[回测] K线就绪 {len(hists)} 只", flush=True)
 
-    # 回测全局量比阈值（标准蓄势路径；近期超卖路径量比下界统一 2.0）
-    TRIGGER_LB_STD = LOW_POS_ENTRY_TRIGGER_LB      # 标准路径：2.0x（大赚票量比2.04~3.05，下界2.5误杀）
-    TRIGGER_LB_OS = LOW_POS_ENTRY_TRIGGER_LB       # 近期超卖路径：2.0x（量比下界统一；超卖"更宽松"体现在位置上限0.65而非量比）
-    TRIGGER_LB_MAX = LOW_POS_ENTRY_TRIGGER_LB_MAX   # 触发量比上限：>7x=动能衰竭，大亏信号
-    TRIGGER_POS60_MAX_STD = LOW_POS_ENTRY_MAX_POS60  # 标准蓄势 pos60 上限：0.55
-    TRIGGER_POS60_MAX_OS = LOW_POS_ENTRY_RECENT_OVERSOLD_POS60_MAX  # 超卖路径 pos60 上限：0.65
+    # 触发参数按路径分流（标准蓄势用 TRIGGER 同族，近期超卖用固化 OS_*；两路径彻底解耦）
+    PARAMS = {
+        "标准蓄势": {
+            "lb_lo": LOW_POS_ENTRY_TRIGGER_LB,
+            "lb_hi": LOW_POS_ENTRY_TRIGGER_LB_MAX,
+            "chg_lo": LOW_POS_ENTRY_TRIGGER_CHG_MIN,
+            "chg_hi": LOW_POS_ENTRY_TRIGGER_CHG_MAX,
+            "amt_lo": LOW_POS_ENTRY_TRIGGER_MIN_AMOUNT,
+            "amt_hi": LOW_POS_ENTRY_TRIGGER_MAX_AMOUNT,
+            "break_ma20": LOW_POS_ENTRY_TRIGGER_BREAK_MA20,
+            "pos60_max": LOW_POS_ENTRY_MAX_POS60,
+            "stop_loss": LOW_POS_ENTRY_STOP_LOSS,
+        },
+        "近期超卖": {
+            "lb_lo": LOW_POS_ENTRY_OS_TRIGGER_LB,
+            "lb_hi": LOW_POS_ENTRY_OS_TRIGGER_LB_MAX,
+            "chg_lo": LOW_POS_ENTRY_OS_TRIGGER_CHG_MIN,
+            "chg_hi": LOW_POS_ENTRY_OS_TRIGGER_CHG_MAX,
+            "amt_lo": LOW_POS_ENTRY_OS_TRIGGER_MIN_AMOUNT,
+            "amt_hi": LOW_POS_ENTRY_OS_TRIGGER_MAX_AMOUNT,
+            "break_ma20": LOW_POS_ENTRY_OS_TRIGGER_BREAK_MA20,
+            "pos60_max": LOW_POS_ENTRY_RECENT_OVERSOLD_POS60_MAX,
+            "stop_loss": LOW_POS_ENTRY_OS_STOP_LOSS,
+        },
+    }
 
     rows, n_trigger = [], 0
     # 第一步：全量扫描所有蓄势日→触发候选（含触发日行业，用于共振判断）
@@ -429,22 +625,43 @@ def backtest(top=600, days=120, min_trigger=1, codes=None):
             row = ind.iloc[i]
             ok, _ = _蓄势通过(row)
             # 检查是否属于近期超卖路径（标准蓄势失败才检查；标准蓄势通过时也计算用于回测分类）
-            recent_os, os_date, os_pos60, os_dist60 = _recent_oversold(ind, i + 1)
+            recent_os, os_date, os_pos60, os_dist60, os_first_idx = _recent_oversold(ind, i + 1)
             if not ok and not recent_os:
                 continue
             # 候选日自身涨幅过滤（双路径统一，防追已启动票）
             chg_today = float(row.get("涨跌幅") or 0)
             if chg_today > LOW_POS_ENTRY_MAX_CHG_TODAY:
                 continue  # 候选日已大涨，不追
+            # ---- 2026-09-21 超卖路径扫描段收紧（与 pick_low_pos_entry 口径一致）----
+            if recent_os:
+                amt_lo, amt_hi = LOW_POS_ENTRY_OS_SCAN_AMOUNT_RANGE
+                amt_i = float(row.get("成交额") or 0)
+                if not (amt_lo <= amt_i <= amt_hi):
+                    continue
+                if float(row["pos60"]) >= LOW_POS_ENTRY_OS_SCAN_POS60_MAX:
+                    continue
+                # 2026-09-23 A方案提速：与 pick_low_pos_entry 超卖段口径一致（距高≤-25%）
+                if float(row.get("dist60") or 0) > LOW_POS_ENTRY_OS_SCAN_DIST60_MAX:
+                    continue
+                # 2026-09-23 A+宽：与 pick 超卖段口径一致（MA20乖离≥-5%）
+                _bt_ma20 = row.get("MA20")
+                if _bt_ma20 is not None and not pd.isna(_bt_ma20):
+                    if (float(row["收盘"]) / float(_bt_ma20) - 1) * 100 < LOW_POS_ENTRY_SCAN_BIAS20_MIN:
+                        continue
+                if os_first_idx is not None and (i - os_first_idx) < LOW_POS_ENTRY_OS_SCAN_OS_AGE_MIN:
+                    continue
+                if float(row.get("lb") or 0) > LOW_POS_ENTRY_OS_SCAN_LB_MAX:
+                    continue
+                if float(row.get("lb5mean") or 0) > LOW_POS_ENTRY_OS_SCAN_LB5MEAN_MAX:
+                    continue
+                if float(row.get("chg5") or 0) > LOW_POS_ENTRY_OS_SCAN_CHG5_MAX:
+                    continue
             # 触发日（次日）的各项指标
             nxt = ind.iloc[i + 1]
-            nxt_chg = float(nxt["涨跌幅"])
-            nxt_close = float(nxt["收盘"])
-            cand_close = float(row["收盘"])
-            entry_gap = (nxt_close - cand_close) / cand_close * 100
-            # 入场价相对于候选日涨幅过大的过滤（防追已启动票：次日跳空高开>3%说明已爆发）
-            if entry_gap > 3.0:
-                continue  # 入场价跳空>3%，安全边际不足
+            # 注：2026-09-12 深夜移除「入场跳空 entry_gap>3% 过滤」。
+            # 该过滤用 (触发日收盘 - 蓄势日收盘)/蓄势日收盘 计算，而蓄势日=触发日前一交易日，
+            # 故 entry_gap 恒等于触发日涨幅；触发条件又要求涨幅 9-15%，二者互斥 → 恒 0 触发。
+            # 实时 check_launch_trigger 本无此过滤，此处删除使回测与实时触发口径一致。
             lb = float(nxt["lb"])
             chg = float(nxt["涨跌幅"])
             nxt_amt = float(nxt.get("成交额", 0))
@@ -455,18 +672,15 @@ def backtest(top=600, days=120, min_trigger=1, codes=None):
             #   近期超卖路径：ok=False, recent_os=True → pos60_max=0.65, lb_threshold=2.0
             if ok:
                 path = "标准蓄势"
-                pos60_max = TRIGGER_POS60_MAX_STD
-                lb_thr = TRIGGER_LB_STD
             else:
                 path = "近期超卖"
-                pos60_max = TRIGGER_POS60_MAX_OS
-                lb_thr = TRIGGER_LB_OS
-            triggered = (lb >= lb_thr
-                         and lb <= TRIGGER_LB_MAX          # 过滤量比过大票（>7x=动能衰竭，大亏）
-                         and LOW_POS_ENTRY_TRIGGER_CHG_MIN <= chg <= LOW_POS_ENTRY_TRIGGER_CHG_MAX  # 涨幅9-15%（甜区）
-                         and LOW_POS_ENTRY_TRIGGER_MIN_AMOUNT <= nxt_amt <= LOW_POS_ENTRY_TRIGGER_MAX_AMOUNT
-                         and (not LOW_POS_ENTRY_TRIGGER_BREAK_MA20 or float(nxt["收盘"]) > ma20)
-                         and nxt_pos60 < pos60_max)
+            p = PARAMS[path]
+            triggered = (lb >= p["lb_lo"]
+                         and lb <= p["lb_hi"]          # 过滤量比过大票（>7x=动能衰竭，大亏）
+                         and p["chg_lo"] <= chg <= p["chg_hi"]  # 涨幅甜区
+                         and p["amt_lo"] <= nxt_amt <= p["amt_hi"]
+                         and (not p["break_ma20"] or float(nxt["收盘"]) > ma20)
+                         and nxt_pos60 < p["pos60_max"])
             if not triggered:
                 continue
             trigger_date = str(pd.Timestamp(nxt["日期"]).date())
@@ -523,7 +737,8 @@ def backtest(top=600, days=120, min_trigger=1, codes=None):
         r1 = float(futs_rows.iloc[0]["收盘"]) / entry - 1 if len(futs_rows) >= 1 else None
         r3 = float(futs_rows.iloc[2]["收盘"]) / entry - 1 if len(futs_rows) >= 3 else None
         r5 = float(futs_rows.iloc[4]["收盘"]) / entry - 1 if len(futs_rows) >= 5 else None
-        hit_sl = bool((futs_rows["收盘"] < entry * (1 + LOW_POS_ENTRY_STOP_LOSS)).any())
+        sl_pct = PARAMS[info["path"]]["stop_loss"]
+        hit_sl = bool((futs_rows["收盘"] < entry * (1 + sl_pct)).any())
         rows.append({
             "代码": info["code"], "名称": info["name"],
             "蓄势日": str(pd.Timestamp(ind.iloc[i]["日期"]).date()),
@@ -594,7 +809,7 @@ def main():
         return
 
     if args.scan:
-        picks = pick_low_pos_entry(as_of=args.as_of, top=args.top)
+        picks = filter_active_pool(pick_low_pos_entry(as_of=args.as_of, top=args.top))
         if not picks:
             print("今日无蓄势候选")
             return
@@ -615,7 +830,7 @@ def main():
                     lines.append(f"· {r['名称']}({r['代码']}) 现价{r['现价']} "
                                  f"位置{r['60日位置']:.0%} 距高{r['dist60%']:.0f}% 量比{r['量比']:.2f}x "
                                  f"买点{r['买点区间']} 止损{r['止损价']}")
-                lines.append("触发条件：量比≥2.0 + 涨幅9-15% + 成交额4-16亿 → 买入，T+3止盈。仅供参考，非投资建议。")
+                lines.append("触发条件：量比≥2.0 + 涨幅9-15% + 成交额4-16亿 → 买入，T+3/T+5止盈（标准蓄势T+3、近期超卖T+5）。仅供参考，非投资建议。")
                 push_alert("低位埋伏蓄势池", "\n".join(lines))
             except Exception as e:
                 print(f"推送失败: {e}")

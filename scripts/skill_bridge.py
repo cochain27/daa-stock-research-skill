@@ -39,16 +39,42 @@ def _run_cli(args, timeout=120):
     """跑CLI，返回stdout文本；失败返回None"""
     if not _skill_available():
         return None
+    proc = None
     try:
         # 用当前解释器（项目 venv）而非裸 "python"，否则子进程缺 pandas/akshare 会静默降级
-        r = subprocess.run(
+        # start_new_session 使子进程进独立进程组，超时时整组 kill，
+        # 避免孙进程继承 stdout 管道导致 communicate 死锁（2026-09-13 周末挂死）。
+        proc = subprocess.Popen(
             [sys.executable, str(CLI)] + args,
-            cwd=str(SKILL_DIR), capture_output=True, text=True,
-            encoding="utf-8", errors="replace", timeout=timeout,
+            cwd=str(SKILL_DIR), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding="utf-8", errors="replace",
+            start_new_session=True,
         )
-        return r.stdout if r.returncode == 0 and r.stdout else None
-    except Exception:
+        out, _ = proc.communicate(timeout=timeout)
+        return out if proc.returncode == 0 and out else None
+    except subprocess.TimeoutExpired:
+        _kill_group(proc)
         return None
+    except Exception:
+        _kill_group(proc)
+        return None
+
+
+def _kill_group(proc):
+    """超时/异常时杀掉子进程所在进程组，防止孤儿进程占用资源"""
+    if proc is None:
+        return
+    try:
+        os.killpg(os.getpgid(proc.pid), 9)  # SIGKILL
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    try:
+        proc.communicate(timeout=5)
+    except Exception:
+        pass
 
 
 def get_sector_rps():

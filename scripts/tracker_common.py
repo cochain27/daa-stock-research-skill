@@ -153,7 +153,7 @@ def record_settlement(r, vtrade_list, settle_price, reason):
 
 def tech_break(r, price, mode="trend"):
     """技术面破坏检测
-    mode="trend": 波段/趋势票 → MA10<MA20 且 破MA10；盈利>3% 破MA10
+    mode="trend": 波段/趋势票 → 破MA20结构止损（兜底，最优先）；破MA10移动止盈（变体B，无盈利门槛）
     mode="short":  短线票     → 跌破MA5
     第2天起(days>=1)才判，避免误杀开盘波动
     返回 (is_break: bool, reason: str)
@@ -184,15 +184,12 @@ def tech_break(r, price, mode="trend"):
             if ret > 3 and price < ma10:
                 return True, f"盈利{ret:+.1f}%已减半，跌破MA10 {ma10:.2f}，移动止盈清仓"
         else:
-            # 趋势走坏：MA10 下穿 MA20 且 现价跌破 MA10
-            if ma10 < ma20 and price < ma10:
-                return True, f"MA10({ma10:.2f})<MA20({ma20:.2f})且破MA10（现价{price:.2f}），趋势走坏"
-            # 盈利>3% 跌破MA10 → 移动止盈离场
-            if ret > 3 and price < ma10:
-                return True, f"盈利{ret:+.1f}%已上移成本线，跌破MA10 {ma10:.2f}，移动止盈离场"
-            # MA20 结构止损（2026-09-09：仅趋势票，收盘跌破MA20即离场，替代纯固定百分比）
-            if str(r.get("策略标签", "")) == "趋势" and price < ma20:
+            # 变体B（2026-09-14 落地）：破MA20结构止损兜底（最优先），破MA10即移动止盈（无盈利门槛）
+            # 与回测 _simulate_let_profit(move_thresh=None) 顺序一致：结构止损(MA20)先于移动止盈(MA10)
+            if price < ma20:
                 return True, f"跌破MA20 {ma20:.2f}（现价{price:.2f}），趋势结构破坏离场"
+            if price < ma10:
+                return True, f"破MA10 {ma10:.2f}（现价{price:.2f}），移动止盈离场"
     except Exception:
         pass
     return False, ""

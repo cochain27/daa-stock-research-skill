@@ -182,3 +182,157 @@ def industry_heat_status_simple(industry_name, window=5, top_n=15):
         days = sorted({str(r["日期"]) for r in rows})
         _heat_days_cache = days[-1] if days else ""
     return industry_heat_status(industry_name, _heat_days_cache, window=window, top_n=top_n)
+
+
+# ===== 个股 → 行业名（东财 f100/f127）+ 个股行业热度 =====
+# 2026-09-23 新增：供晨报/复盘「持有中跟踪」表展示行业热度列（此前该列仅低位池有）。
+# 缓存 data/stock_industry_cache.csv（代码,行业）：① 本地 watch_history*.csv 播种兜底
+# ② 命中即不联网 ③ 未命中走东财批量接口（ulist.np f100，一次多票）④ 单票 f127 兜底。
+# 东财接口本机不稳定（RemoteDisconnected 频发，push2delay 稍好），故多host + 重试 + 本地播种。
+IND_CACHE_FILE = BASE / "data" / "stock_industry_cache.csv"
+_EM_HOSTS = ("push2delay.eastmoney.com", "push2.eastmoney.com", "17.push2.eastmoney.com")
+_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+       "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+_ind_cache = None
+
+
+def _seed_from_local(cache):
+    """用本地已有行业列的文件播种缓存（不覆盖已有键，用于离线兜底）。"""
+    seeds = [
+        BASE / "data" / "watch_history_enriched.csv",
+        BASE / "data" / "watch_history.csv",
+    ]
+    for p in seeds:
+        if not p.exists():
+            continue
+        try:
+            with p.open(encoding="utf-8-sig") as f:
+                for r in csv.DictReader(f):
+                    c = str(r.get("代码", "")).split(".")[0].strip()
+                    ind = str(r.get("行业", "")).strip()
+                    if c and ind and not cache.get(c):
+                        cache[c] = ind
+        except Exception:
+            pass
+
+
+def _load_ind_cache():
+    global _ind_cache
+    if _ind_cache is None:
+        _ind_cache = {}
+        if IND_CACHE_FILE.exists():
+            try:
+                with IND_CACHE_FILE.open(encoding="utf-8-sig") as f:
+                    for r in csv.DictReader(f):
+                        c = str(r.get("代码", "")).strip()
+                        if c:
+                            _ind_cache[c] = str(r.get("行业", "")).strip()
+            except Exception:
+                pass
+        _seed_from_local(_ind_cache)
+    return _ind_cache
+
+
+def _save_ind_cache():
+    cache = _load_ind_cache()
+    try:
+        IND_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with IND_CACHE_FILE.open("w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=["代码", "行业"])
+            w.writeheader()
+            for c in sorted(cache):
+                w.writerow({"代码": c, "行业": cache[c]})
+    except Exception:
+        pass
+
+
+def _em_get(url, timeout):
+    import requests
+    import fetch_data  # noqa: F401  触发 fetch_data 的直连 patch（trust_env=False）
+    r = requests.get(url, headers={"User-Agent": _UA}, timeout=timeout)
+    return (r.json() or {}).get("data") or {}
+
+
+def fetch_industries(codes, timeout=8, tries=2):
+    """批量取个股行业名（东财 f100）。返回 {code: 行业名}，取不到的键不出现。
+
+    先批量（ulist.np，一次多票），批量失败再逐票（stock/get f127）。
+    """
+    codes = [str(c).split(".")[0].strip() for c in codes if str(c).strip()]
+    out = {}
+    if not codes:
+        return out
+    secids = ",".join(("1." if c.startswith("6") else "0.") + c for c in codes)
+    for attempt in range(tries):
+        for host in _EM_HOSTS:
+            try:
+                d = _em_get(f"https://{host}/api/qt/ulist.np/get?secids={secids}"
+                            f"&fields=f12,f14,f100&fltt=2", timeout)
+                for it in (d.get("diff") or []):
+                    c = str(it.get("f12") or "").strip()
+                    ind = str(it.get("f100") or "").strip()
+                    if c and ind and ind != "-":
+                        out[c] = ind
+            except Exception:
+                pass
+            if out:
+                break
+        if out:
+            break
+    missing = [c for c in codes if c not in out]
+    for c in missing:  # 逐票兜底（批量被限流时）
+        for host in _EM_HOSTS:
+            try:
+                d = _em_get(f"https://{host}/api/qt/stock/get?secid="
+                            f"{'1.' if c.startswith('6') else '0.'}{c}&fields=f57,f127", timeout)
+                ind = str(d.get("f127") or "").strip()
+                if ind and ind != "-":
+                    out[c] = ind
+                    break
+            except Exception:
+                continue
+    return out
+
+
+def prefetch_industries(codes):
+    """把 codes 中缺失的行业名补齐并落盘（缓存内已有则零网络开销）。"""
+    cache = _load_ind_cache()
+    miss = [str(c).split(".")[0].strip() for c in codes if str(c).strip()]
+    miss = [c for c in miss if not cache.get(c)]
+    if not miss:
+        return cache
+    got = fetch_industries(sorted(set(miss)))
+    if got:
+        cache.update(got)
+        _save_ind_cache()
+    return cache
+
+
+def stock_industry(code):
+    """个股行业名（东财三级名）。本地缓存优先，未命中联网批量查询。
+
+    失败返回 ""（调用方展示为 —），不抛异常、不阻断主流程。
+    行业名未查到时不写缓存，下次仍可重试。
+    """
+    code = str(code).split(".")[0].strip()
+    if not code:
+        return ""
+    cache = _load_ind_cache()
+    if cache.get(code):
+        return cache[code]
+    prefetch_industries([code])
+    return _load_ind_cache().get(code, "")
+
+
+def stock_heat(code, today, window=5, top_n=15):
+    """个股行业热度：(展示串, 行业名)。
+
+    展示串与低位池「连续追踪」列口径一致：🔥主线3/5日（rank_days=0 时只给标签）。
+    行业名取不到时返回 ("—", "")。
+    """
+    ind = stock_industry(code)
+    if not ind:
+        return "—", ""
+    tag, rank_days, heat_days, _ = industry_heat_status(ind, today, window=window, top_n=top_n)
+    s = tag + (f"{rank_days}/{heat_days}日" if rank_days else "")
+    return s, ind
