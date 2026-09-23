@@ -710,12 +710,21 @@ def run_close():
         from warm_start_entry import pick_warm_start as _pick_warm
         warm = _pick_warm(top=600, update=False, quiet=True)
         if warm:
-            lines.append("**今日新信号**（信号日收盘确认，T+1 开盘介入）\n")
-            # 2026-09-23 版面调整：删除「周线上扬」列（策略筛选硬性条件，不再展示）
-            lines.append("| 股票 | 现价 | 量比 | 5日涨幅 | 60日位置 | 成交额 | 前10振幅 | 量能比 | 硬止损 |")
-            lines.append("|------|------|------|---------|----------|--------|----------|--------|------|")
+            lines.append("**今日新信号**（信号日收盘确认，T+1 开盘介入，无固定止盈最长 T+5）\n")
+            # 2026-09-23 晚版面调整（用户拍板）：删「前10振幅」「量能比」列（蓄势证据列，筛选口径不变见脚注），加「行业热度」列
+            lines.append("| 股票 | 行业热度 | 现价 | 量比 | 5日涨幅 | 60日位置 | 成交额 | 硬止损 |")
+            lines.append("|------|----------|------|------|---------|----------|--------|--------|")
+            try:
+                from industry_heat_tool import prefetch_industries as _pf
+                _pf([w["代码"] for w in warm[:8]])
+            except Exception:
+                pass
             for w in warm[:8]:
-                lines.append(f"| {w['名称']} | {w['现价']:.2f} | {w['量比']:.2f}x | {w['5日涨幅%']:+.1f}% | {w['60日位置']:.0%} | {w['成交额亿']:.1f}亿 | {w['前10振幅%']:.1f}% | {w['量能比']:.2f} | {w['止损价']:.2f} |")
+                try:
+                    heat_s, _ = stock_heat(w["代码"], today)
+                except Exception:
+                    heat_s = "—"
+                lines.append(f"| {w['名称']} | {heat_s} | {w['现价']:.2f} | {w['量比']:.2f}x | {w['5日涨幅%']:+.1f}% | {w['60日位置']:.0%} | {w['成交额亿']:.1f}亿 | {w['止损价']:.2f} |")
             lines.append("")
         else:
             lines.append("*今日无满足最优档画像的初动票（缩量调整日量比普遍<1.3，属正常），可关注明日更新。*\n")
@@ -728,23 +737,28 @@ def run_close():
         trows = warm_tracking_rows(today)
         if trows:
             lines.append("**持有中跟踪**（T+n=距信号日交易日数；出场规则同上）\n")
-            # 2026-09-23 版面调整：新增「行业热度」列（口径同低位池连续追踪：🔥主线n/m日）
-            lines.append("| 股票 | 行业热度 | 信号日 | 天数 | 现价 | 距信号 | 破MA5 | 建议 |")
-            lines.append("|------|----------|--------|------|------|--------|-------|------|")
+            # 2026-09-23 晚版面调整：加「最高浮盈」（T+1以来最高价相对信号日收盘，让利润奔跑的回吐可视化）与「硬止损」列
+            lines.append("| 股票 | 行业热度 | 信号日 | 天数 | 现价 | 距信号 | 最高浮盈 | 破MA5 | 硬止损 | 建议 |")
+            lines.append("|------|----------|--------|------|------|--------|----------|-------|--------|------|")
             for r in trows:
                 last_s = f"{r['现价']:.2f}" if r["现价"] is not None else "—"
                 dist_s = f"{r['距信号%']:+.1f}%" if r["距信号%"] is not None else "—"
+                peak_s = f"{r['最高浮盈%']:+.1f}%" if r.get("最高浮盈%") is not None else "—"
                 days_s = f"T+{r['天数']}" if r["天数"] is not None else "—"
                 below_s = ("是" if r["破MA5"] else "否") if r["破MA5"] is not None else "—"
+                try:
+                    stop_s = f"{float(r['止损']):.2f}"
+                except Exception:
+                    stop_s = str(r.get("止损") or "—")
                 try:
                     heat_s, _ = stock_heat(r["代码"], today)
                 except Exception:
                     heat_s = "—"
-                lines.append(f"| {r['名称']} | {heat_s} | {r['信号日'][5:]} | {days_s} | {last_s} | {dist_s} | {below_s} | {r['建议']} |")
+                lines.append(f"| {r['名称']} | {heat_s} | {r['信号日'][5:]} | {days_s} | {last_s} | {dist_s} | {peak_s} | {below_s} | {stop_s} | {r['建议']} |")
             lines.append("")
     except Exception as e:
         print(f"[初动跟踪] 失败 {e}")
-    lines.append("> **交易规则（V2 已固化，1366 样本回测）**：信号日收盘确认 → 次日开盘介入；-8% 硬止损（硬止损=现价×0.92）；持有 T+2 收盘起收盘破 MA5 → 次日开盘离场；无固定止盈让利润奔跑；最长持有 T+5 收盘强制离场。基线 T5 胜率 59.0%/盈亏比 3.07；V2 后盈亏比 4.46（代价胜率 -4.7pp）；大盘过滤已证伪，不设开闸条件。")
+    # 2026-09-23 晚版面调整（用户拍板）：交易规则+回测口径脚注移出推送（操作信息已由表格列覆盖，口径入台账）
     lines.append("")
 
     # ===== 本周低位启动观察（趋势侧补充）=====
@@ -809,7 +823,7 @@ def run_close():
                 for w in shown:
                     lines.append(f"| {w['名称']} | {w.get('行业','未知')} | {w['现价']:.2f} | {w['60日位置']:.0%} | {w['量比']:.2f}x | {w['5日涨幅%']:+.1f}% | {w['20日振幅%']:.0f}% | {w['买点区间']} | {w['止损价']:.2f} | {w.get('蓄势路径','标准蓄势')} |")
                 lines.append("")
-            lines.append("> ⚠️ 研究观察池（两路径并存：标准蓄势+近期超卖；参数=量比2-7x+成交额4-16亿+涨幅9-15%+位置<55%；2024至今全历史回测428次触发：T5均值+3.4%、胜率52.7%、大亏率6.7%）；**非买入推荐**，仅供盘后复盘研究参考。")
+            lines.append("> ⚠️ 研究观察池（标准蓄势+近期超卖双路径）；**非买入推荐**，仅供盘后研究参考。")
             lines.append("")
         else:
             lines.append("今日未筛出符合条件的低位启动股（可能整体处于高位或数据缺失），可关注明日更新。")

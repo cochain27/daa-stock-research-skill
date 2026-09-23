@@ -101,7 +101,7 @@ from config import (LOW_POS_ENTRY_ENABLED, LOW_POS_ENTRY_MAX_POS60,
 from fetch_data import get_market_snapshot, get_realtime_quotes
 from stock_screener import ALLOW_CODE_PREFIX, MAX_SAME_INDUSTRY
 
-SINA_KLINE = "https://quotes.sina.cn/cn/api_json_v2.php/CN_MarketDataService.getKLineData"
+SINA_KLINE = "https://quotes.sina.cn/cn/api/json_v2.php/CN_MarketDataService.getKLineData"
 TENCENT_KLINE = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/120.0 Safari/537.36")

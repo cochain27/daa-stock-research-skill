@@ -171,8 +171,10 @@ def warm_tracking_rows(today):
     """初动池跨日跟踪行（结构化，供笔记本跟踪表与收盘复盘共用）。
 
     读笔记本初动跟踪表旧行（信号日 != today），用本地 K 线刷新跟踪指标。
-    返回 dict 列表：信号日/代码/名称/现价/距信号%/破MA5/天数/建议/止损。
+    返回 dict 列表：信号日/代码/名称/现价/距信号%/最高浮盈%/破MA5/天数/建议/止损。
     天数=T+n（n=最新收盘距信号日的交易日数，信号日=T+0）；
+    最高浮盈%=信号日次日(T+1)以来最高价相对信号日收盘的最大涨幅（让利润奔跑策略的回吐可视化，
+    2026-09-23 版面新增，供晨报/复盘跟踪表「最高浮盈」列）。
     距今 >6 个交易日（早已过 T+5 强制离场）的行剔除（流水表仍有记录）。
     """
     path = NB_FILES["初动"]
@@ -200,7 +202,7 @@ def warm_tracking_rows(today):
     for sig_date, code, name, hard_stop in meta:
         industry = (stock_industry(code) or "") if stock_industry else ""
         row = {"信号日": sig_date, "代码": code, "名称": name, "现价": None,
-               "距信号%": None, "破MA5": None, "天数": None, "建议": "", "止损": hard_stop,
+               "距信号%": None, "最高浮盈%": None, "破MA5": None, "天数": None, "建议": "", "止损": hard_stop,
                "行业": industry}
         df = _load_kline(code)
         if df is None or "日期" not in df.columns or len(df) < 6:
@@ -224,6 +226,16 @@ def warm_tracking_rows(today):
             continue  # T+5 已过，清除（记录在流水表）
         last = closes[-1]
         sig_close = closes[sig_idx]
+        # 最高浮盈%：T+1（信号日次日）以来最高价 / 信号日收盘 - 1（2026-09-23 新增）
+        peak = None
+        if "最高" in df.columns:
+            try:
+                highs = df["最高"].astype(float).tolist()
+                seg = highs[sig_idx + 1:]
+                if seg and sig_close:
+                    peak = (max(seg) / sig_close - 1) * 100
+            except Exception:
+                peak = None
         try:
             dist = (last / sig_close - 1) * 100 if sig_close else float("nan")
         except Exception:
@@ -239,6 +251,7 @@ def warm_tracking_rows(today):
         else:
             advice = "持有中"
         row.update({"现价": last, "距信号%": dist if dist == dist else None,
+                    "最高浮盈%": peak if peak == peak else None,
                     "破MA5": below, "天数": t_days, "建议": advice})
         out.append(row)
     return out

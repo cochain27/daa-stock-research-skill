@@ -58,7 +58,7 @@ def generate_full_report(temp, details, pos_advice, boards, picks, rps_rows=None
             names = "、".join(f"{p['名称']}" for p in short_list[:4])
             lines.append(f"- ⚡短线激进池 {len(short_list)} 只：{names}（详情见 03）")
     if warm_picks:
-        names = "、".join(f"{w['名称']}({w['代码']})" for w in warm_picks[:4])
+        names = "、".join(f"{w['名称']}" for w in warm_picks[:4])
         more = f" 等{len(warm_picks)}只" if len(warm_picks) > 4 else ""
         lines.append(f"- 🔥初动池（第3策略）{len(warm_picks)} 只候选：{names}{more}（详情见 03）")
     if not picks and not warm_picks:
@@ -217,15 +217,24 @@ def generate_full_report(temp, details, pos_advice, boards, picks, rps_rows=None
 
     # 温和放量初动池（第3正式策略）—— 2026-09-20 升级：观察→正式策略，固化 V2 破MA5离场
     # 2026-09-21 版面重构：初动池从独立 04 章并入「03 推荐个股」作为子池 (3)（用户版面要求）
-    lines.append("### (3) 温和放量初动池（第3策略）\n")
+    lines.append("### (3) 温和放量初动池（第3策略；T+1 开盘介入，无固定止盈最长 T+5）\n")
     if not warm_picks:
         lines.append("> 今日无满足最优档画像的初动票（缩量调整日量比普遍<1.3，属正常），可关注明日更新。\n")
     else:
-        # 2026-09-23 版面调整：删除「周线上扬」列（策略筛选硬性条件，不再展示）
-        lines.append("| 股票 | 现价 | 量比 | 5日涨幅 | 60日位置 | 成交额 | 前10振幅 | 量能比 | 硬止损 |")
-        lines.append("|------|------|------|---------|----------|--------|----------|--------|------|")
+        # 2026-09-23 晚版面调整（用户拍板）：删「前10振幅」「量能比」列（蓄势证据列，筛选口径不变见脚注），加「行业热度」列
+        lines.append("| 股票 | 行业热度 | 现价 | 量比 | 5日涨幅 | 60日位置 | 成交额 | 硬止损 |")
+        lines.append("|------|----------|------|------|---------|----------|--------|--------|")
+        try:
+            from industry_heat_tool import prefetch_industries as _pf, stock_heat as _sh
+            _pf([w["代码"] for w in warm_picks[:8]])
+        except Exception:
+            _sh = None
         for w in warm_picks[:8]:
-            lines.append(f"| {w['名称']}({w['代码']}) | {w['现价']:.2f} | {w['量比']:.2f}x | {w['5日涨幅%']:+.1f}% | {w['60日位置']:.0%} | {w['成交额亿']:.1f}亿 | {w['前10振幅%']:.1f}% | {w['量能比']:.2f} | {w['止损价']:.2f} |")
+            try:
+                heat_s, _ = _sh(w["代码"], today)
+            except Exception:
+                heat_s = "—"
+            lines.append(f"| {w['名称']} | {heat_s} | {w['现价']:.2f} | {w['量比']:.2f}x | {w['5日涨幅%']:+.1f}% | {w['60日位置']:.0%} | {w['成交额亿']:.1f}亿 | {w['止损价']:.2f} |")
         lines.append("")
     # 持有中跟踪（跨日）—— 2026-09-23 与收盘复盘版面对齐：新增该子表 + 行业热度列
     trows = []
@@ -235,24 +244,28 @@ def generate_full_report(temp, details, pos_advice, boards, picks, rps_rows=None
         trows = warm_tracking_rows(today)
         if trows:
             lines.append("**持有中跟踪**（T+n=距信号日交易日数；出场规则同上）\n")
-            lines.append("| 股票 | 行业热度 | 信号日 | 天数 | 现价 | 距信号 | 破MA5 | 建议 |")
-            lines.append("|------|----------|--------|------|------|--------|-------|------|")
+            # 2026-09-23 晚版面调整：加「最高浮盈」（T+1以来最高价相对信号日收盘，让利润奔跑的回吐可视化）与「硬止损」列
+            lines.append("| 股票 | 行业热度 | 信号日 | 天数 | 现价 | 距信号 | 最高浮盈 | 破MA5 | 硬止损 | 建议 |")
+            lines.append("|------|----------|--------|------|------|--------|----------|-------|--------|------|")
             for r in trows:
                 last_s = f"{r['现价']:.2f}" if r["现价"] is not None else "—"
                 dist_s = f"{r['距信号%']:+.1f}%" if r["距信号%"] is not None else "—"
+                peak_s = f"{r['最高浮盈%']:+.1f}%" if r.get("最高浮盈%") is not None else "—"
                 days_s = f"T+{r['天数']}" if r["天数"] is not None else "—"
                 below_s = ("是" if r["破MA5"] else "否") if r["破MA5"] is not None else "—"
+                try:
+                    stop_s = f"{float(r['止损']):.2f}"
+                except Exception:
+                    stop_s = str(r.get("止损") or "—")
                 try:
                     heat_s, _ = stock_heat(r["代码"], today)
                 except Exception:
                     heat_s = "—"
-                lines.append(f"| {r['名称']} | {heat_s} | {r['信号日'][5:]} | {days_s} | {last_s} | {dist_s} | {below_s} | {r['建议']} |")
+                lines.append(f"| {r['名称']} | {heat_s} | {r['信号日'][5:]} | {days_s} | {last_s} | {dist_s} | {peak_s} | {below_s} | {stop_s} | {r['建议']} |")
             lines.append("")
     except Exception as e:
         print(f"[初动跟踪] 失败 {e}")
-    if warm_picks or trows:
-        lines.append("> **交易规则（V2 已固化，1366 样本回测）**：信号日收盘确认 → 次日开盘介入；**-8% 硬止损**（表内硬止损=现价×0.92）；持有 T+2 收盘起**收盘破 MA5 → 次日开盘离场**；**无固定止盈**（让利润奔跑）；最长持有 T+5 收盘强制离场。")
-        lines.append("> 口径：量比1.3-2.5+5日3-8%+位置<80%+站上MA20+MACD多头+周线共振+保守蓄势+成交额≤16亿；基线 T5 胜率 59.0%/均值+4.20%/盈亏比 3.07；V2 固化后盈亏比 4.46、最大亏 -12.3%→-9.3%（代价：胜率 -4.7pp）。大盘过滤已证伪（弱市信号更优），不设开闸条件。\n")
+    # 2026-09-23 晚版面调整（用户拍板）：交易规则+口径脚注整体移出推送（操作信息已由表格列覆盖，口径入台账）
 
     # 低位埋伏候选池（观察池）—— 2026-09-12 新增
     # ⚠️ 本池为研究观察工具，非买入推荐。两路径并存（标准蓄势+近期超卖），仅供盘后复盘研究参考。
@@ -262,7 +275,7 @@ def generate_full_report(temp, details, pos_advice, boards, picks, rps_rows=None
     if not low_pos_picks:
         lines.append("> 今日无低位埋伏候选（T-1 蓄势形态扫描结果）。\n")
     else:
-        lines.append("> ⚠️ **研究观察池**：两路径并存（标准蓄势+近期超卖），参数=量比2-7x+成交额4-16亿+涨幅9-15%+位置<55%；2024-04至今全历史回测428次触发：T5均值+3.4%、胜率52.7%、大赚(≥10%)19.5%、大亏(≤-10%)6.7%、8日止损触发12.9%。**非买入推荐**，仅供盘后复盘研究参考。\n")
+        lines.append("> ⚠️ **研究观察池**（标准蓄势+近期超卖双路径）。**非买入推荐**，仅供盘后研究参考。\n")
         lines.append("| # | 名称 | 路径 | 现价 | 60日位置 | 距高% | 量比 | 成交额亿 | 止损 |")
         lines.append("|---|------|------|------|----------|-------|------|----------|------|")
         for i, p in enumerate(low_pos_picks, 1):
@@ -331,10 +344,10 @@ def generate_full_report(temp, details, pos_advice, boards, picks, rps_rows=None
     else:
         lines.append("> 当前无未结清推荐跟踪池。今日新推荐将自动入池，收盘后启动连续跟踪。\n")
 
-    lines.append("### (3) 风控提醒（列表）")
-    lines.append("- **右侧趋势票**：止损 -6%；收盘破 MA20 结构止损离场；破 MA10 移动止盈离场（无盈利门槛，让利润奔跑）；满28日触发展期评估（趋势+量能完好且展期≤2只可展期），展期后继续 MA10 跟踪，最长60天强制离场")
-    lines.append("- **短线激进票（新出场·2026-09-20 固化，1051 笔回测确认）**：止损 -5.5%；+5% 减半；减半后盈利>3% 收盘破 MA10 移动止盈清仓（无 +8% 止盈2）；满3天浮亏时间止损；极限5天强制离场；破MA5生命线离场；每日重评情绪分，低于门槛剔除")
-    lines.append("- **初动池票（第3策略）**：-8% 硬止损；持有 T+2 收盘起收盘破 MA5 → 次日开盘离场；无固定止盈让利润奔跑；最长 T+5 收盘强制离场（V2 已固化：回测盈亏比 3.07→4.46，最大亏 -12.3%→-9.3%）")
+    lines.append("### (3) 风控速查")
+    lines.append("- 趋势票：-6% 止损 · 破MA20 离场 · 破MA10 移动止盈")
+    lines.append("- 短线票：-5.5% 止损 · +5% 减半 · 破MA10 清仓 · 最长5天")
+    lines.append("- 初动票：-8% 硬止损 · 破MA5 次日离场 · 最长T+5")
     lines.append("")
     lines.append("---")
     lines.append("*免责声明：本报告为个人研究记录，不构成任何投资建议；市场有风险，据此操作风险自负。*")
