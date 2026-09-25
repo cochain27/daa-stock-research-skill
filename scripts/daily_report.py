@@ -30,6 +30,16 @@ try:
 except Exception:
     WARM_START_ENABLED_REPORT = False
 
+# 低位观察池连续追踪（近10天在册票）：与收盘复盘共用同一数据源（watch_history.csv）
+# 2026-09-24 修复：晨报 (2) 段此前错接趋势/短线推荐跟踪池，改为低位池自身追踪，
+#   与复盘 _track_watch_pool 完全一致，消除两报展示差异。
+try:
+    from close_review import _track_watch_pool
+    from industry_heat_tool import industry_heat_status as _ind_heat_status
+    LOW_POS_TRACK_ENABLED = True
+except Exception:
+    LOW_POS_TRACK_ENABLED = False
+
 
 def generate_full_report(temp, details, pos_advice, boards, picks, rps_rows=None, track_rows=None, track_overview=None,
                          market_env=None, env_desc=None, env_reason=None,
@@ -243,9 +253,9 @@ def generate_full_report(temp, details, pos_advice, boards, picks, rps_rows=None
         from industry_heat_tool import stock_heat
         trows = warm_tracking_rows(today)
         if trows:
-            lines.append("**持有中跟踪**（T+n=距信号日交易日数；出场规则同上）\n")
+            lines.append("**▎持有中跟踪**（-8%硬止损 · 破MA5次日离场 · 最长T+5）\n")
             # 2026-09-23 晚版面调整：加「最高浮盈」（T+1以来最高价相对信号日收盘，让利润奔跑的回吐可视化）与「硬止损」列
-            lines.append("| 股票 | 行业热度 | 信号日 | 天数 | 现价 | 距信号 | 最高浮盈 | 破MA5 | 硬止损 | 建议 |")
+            lines.append("| 股票 | 行业热度 | 信号日 | 天数 | 现价 | 距信号 | 最高浮盈 | 破<br/>MA5 | 硬止损 | 建议 |")
             lines.append("|------|----------|--------|------|------|--------|----------|-------|--------|------|")
             for r in trows:
                 last_s = f"{r['现价']:.2f}" if r["现价"] is not None else "—"
@@ -275,7 +285,7 @@ def generate_full_report(temp, details, pos_advice, boards, picks, rps_rows=None
     if not low_pos_picks:
         lines.append("> 今日无低位埋伏候选（T-1 蓄势形态扫描结果）。\n")
     else:
-        lines.append("> ⚠️ **研究观察池**（标准蓄势+近期超卖双路径）。**非买入推荐**，仅供盘后研究参考。\n")
+        lines.append("> ⚠️ **研究观察池**，**非买入推荐**，仅供盘后研究参考。\n")
         lines.append("| # | 名称 | 路径 | 现价 | 60日位置 | 距高% | 量比 | 成交额亿 | 止损 |")
         lines.append("|---|------|------|------|----------|-------|------|----------|------|")
         for i, p in enumerate(low_pos_picks, 1):
@@ -300,10 +310,50 @@ def generate_full_report(temp, details, pos_advice, boards, picks, rps_rows=None
             except: pass
             lines.append(f"| {i} | {p['名称']}({p['代码']}) | {path_icon} | {close} | {pos60} | {dist60} | {lb} | {amt} | {sl} |")
         lines.append("")
-        lines.append("> 明日关注：若量比≥2.0x + 涨幅9-15% + 成交额4-16亿 + 突破MA20 → 可能触发买入信号（届时再做决策）\n")
+        lines.append("> 明日关注：若量比≥1.5x + 涨幅9-15% + 成交额4-16亿 + 突破MA20 → 可能触发买入信号（届时再做决策）\n")
 
-    # 推荐跟踪池（连续跟踪分析）+ 虚拟净值
-    lines.append("### (2) 连续追踪（推荐跟踪池）\n")
+    # ===== 连续追踪 =====
+    # 2026-09-24 修复：低位观察池在册票（watch_history）是主体，趋势/短线推荐跟踪池为补充。
+    #   此前 (2) 段只渲染推荐跟踪池（track_rows），低位池在册票晨报完全看不到（复盘有）。
+    lines.append("### ▎(2) 连续追踪\n")
+    # --- 低位观察池在册票（与收盘复盘 _track_watch_pool 同源）---
+    low_tracked = []
+    if LOW_POS_TRACK_ENABLED:
+        try:
+            low_tracked = _track_watch_pool(datetime.now(), lookback_days=10)
+        except Exception as e:
+            print(f"[低位追踪] 失败 {e}")
+    low_old = [t for t in low_tracked if t["first_date"] != today]  # 当日新入池已在 (1) 候选表，不重复
+    if low_old:
+        lines.append("**低位观察池在册**（近10天持续关注）\n")
+        lines.append("| 股票 | 行业热度 | 首现日 | 天数 | 现价 | 买点区间 | 止损 | 状态 |")
+        lines.append("|------|----------|--------|------|------|----------|------|-------|")
+        for t in low_old:
+            cur = f"{t['cur_price']:.2f}" if t["cur_price"] else "—"
+            sl = f"{t['stop_loss']:.2f}" if t["stop_loss"] else "—"
+            chg = f"{t['chg_since_first']:+.1f}%" if t["chg_since_first"] is not None else "—"
+            bz = t.get("buy_zone") or "—"
+            heat_tag = "—"
+            try:
+                if _ind_heat_status:
+                    heat_tag, rd, td, _ = _ind_heat_status(t.get("industry", ""), today)
+                    heat_tag = heat_tag + (f"{rd}/{td}日" if rd else "")
+            except Exception:
+                pass
+            act = t.get("action") or ""
+            if act and act != "观察":
+                status_merged = f"{t['status_tag']}·{act}"
+            else:
+                status_merged = t["status_tag"]
+            danger = t["status_tag"] in ("🚨触及止损",) or (t["stop_loss"] and t["cur_price"] and (t["cur_price"] - t["stop_loss"]) / t["cur_price"] <= 0.02)
+            flag = "🚨" if danger else ("⚠️" if t["status_tag"].startswith("📈连续") else "🆕")
+            lines.append(f"| {flag} {t['name']} | {heat_tag} | {t['first_date']} | **{t['days_count']}** | {cur} {chg} | {bz} | {sl} | {status_merged} |")
+        lines.append("")
+        urgent = [t for t in low_old if t["days_count"] >= 3 or t["status_tag"] == "🚨触及止损" or (t["stop_loss"] and t["cur_price"] and (t["cur_price"] - t["stop_loss"]) / t["cur_price"] <= 0.02)]
+        if urgent:
+            lines.append(f"> ⚠️ 其中 **{len(urgent)} 只**已连续≥3天或临近止损，见上表 🚨/⚠️ 行，需人工优先决策。")
+            lines.append("")
+    # --- 趋势/短线推荐跟踪池（补充）---
     if track_rows:
         ext_n = track_overview.get('展期数', 0)
         ext_s = f"｜ 🟢展期中 {ext_n} 只（≤2只，最长60天）" if ext_n else ""
@@ -316,7 +366,7 @@ def generate_full_report(temp, details, pos_advice, boards, picks, rps_rows=None
         if short_nav:
             nav_parts.append(f"**短线净值 {short_nav.get('净值', 0):.0f}（{short_nav.get('累计收益率', 0):+.2f}%）**")
         nav_s = ("｜ " + "｜ ".join(nav_parts)) if nav_parts else ""
-        lines.append(f"> 当前跟踪 **{track_overview.get('总只数', 0)} 只**，总盈亏 {track_overview.get('总盈亏', 0):+.1f}%（平均 {track_overview.get('平均盈亏', 0):+.1f}%）{ext_s}{nav_s}｜ {track_overview.get('建议', '')}\n")
+        lines.append(f"> 推荐跟踪池 **{track_overview.get('总只数', 0)} 只**，总盈亏 {track_overview.get('总盈亏', 0):+.1f}%（平均 {track_overview.get('平均盈亏', 0):+.1f}%）{ext_s}{nav_s}｜ {track_overview.get('建议', '')}\n")
         # 表格含止损/止盈字段（简洁展示）
         lines.append("| 名称 | 策略 | 推荐日 | 现价 | 累计% | 最高% | 止损 | 止盈1 | 止盈2 | 操作建议 |")
         lines.append("|------|------|--------|------|-------|-------|------|-------|-------|----------|")
@@ -341,8 +391,8 @@ def generate_full_report(temp, details, pos_advice, boards, picks, rps_rows=None
         if sug_max and track_overview.get('总只数', 0) >= 2 and track_overview.get('平均盈亏', 0) < -3:
             lines.append(f"\n> ⚠️ 跟踪池平均浮亏 {track_overview['平均盈亏']:+.1f}%，且今日建议仓位 {pos_advice[0]}，优先处理亏损票、暂缓开新仓")
         lines.append("")
-    else:
-        lines.append("> 当前无未结清推荐跟踪池。今日新推荐将自动入池，收盘后启动连续跟踪。\n")
+    elif not low_old:
+        lines.append("> 当前无未结清推荐跟踪池，低位观察池亦无在册存量。今日新推荐将自动入池，收盘后启动连续跟踪。\n")
 
     lines.append("### (3) 风控速查")
     lines.append("- 趋势票：-6% 止损 · 破MA20 离场 · 破MA10 移动止盈")
@@ -352,7 +402,7 @@ def generate_full_report(temp, details, pos_advice, boards, picks, rps_rows=None
     lines.append("---")
     lines.append("*免责声明：本报告为个人研究记录，不构成任何投资建议；市场有风险，据此操作风险自负。*")
     lines.append("*数据说明：K线为腾讯前复权口径，盘前/节假日部分维度数据缺失时以已得数据为准；推荐即虚拟成交（按推荐时实时价入账）。*")
-    lines.append(f"*生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M')} ｜ 大A每日投研系统（三正式策略+一观察池）*")
+    lines.append(f"*生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M')} ｜ 大A每日投研系统（三正式策略+一观察池）｜ Rachael*")
     return "\n".join(lines)
 
 

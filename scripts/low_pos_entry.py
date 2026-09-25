@@ -71,6 +71,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from config import (LOW_POS_ENTRY_ENABLED, LOW_POS_ENTRY_MAX_POS60,
                     LOW_POS_ENTRY_SCAN_POS60_MAX,
                     LOW_POS_ENTRY_SCAN_BIAS20_MIN,
+                    LOW_POS_ENTRY_SCAN_MA20_UP, LOW_POS_ENTRY_TOPN,
                     LOW_POS_ENTRY_MIN_DIST60, LOW_POS_ENTRY_MAX_LB5,
                     LOW_POS_ENTRY_MAX_LB5_MEAN, LOW_POS_ENTRY_CHG5_RANGE,
                     LOW_POS_ENTRY_MAX_CHG_TODAY,
@@ -185,6 +186,9 @@ def _indicators(df):
     d["amp20"] = (d["收盘"].rolling(20).max() - d["收盘"].rolling(20).min()) / d["收盘"].rolling(20).mean() * 100
     # 5日涨幅
     d["chg5"] = (d["收盘"] / d["收盘"].shift(5) - 1) * 100
+    # MA20 上行（2026-09-23 晚 A 方案）：当日 MA20 > 5 日前 MA20 = 20日线斜率>0。
+    #   前期 MA20 为 NaN 时比较结果为 False（自动挡掉数据不足的票），安全。
+    d["ma20up"] = d["MA20"] > d["MA20"].shift(5)
     return d
 
 
@@ -229,6 +233,11 @@ def _蓄势通过(row):
         _bias20 = (float(row["收盘"]) / float(_ma20) - 1) * 100
         if _bias20 < LOW_POS_ENTRY_SCAN_BIAS20_MIN:
             return False, f"MA20乖离{_bias20:.1f}%<-5%（未企稳，下跌中继）"
+    # 2026-09-23 晚 A 方案：MA20 上行硬过滤（20日线斜率>0，用户拍板）。
+    #   18维新因子挖掘唯一真增量：并集10启动率 9.65%→13.31%（+3.7pp），
+    #   正交性/边际贡献/分时段三重检验通过；「未站上MA20但信号≥2」类负贡献票被挡。
+    if LOW_POS_ENTRY_SCAN_MA20_UP and not row.get("ma20up"):
+        return False, "MA20未上行（20日线斜率≤0）"
     lb = row.get("lb")
     lbm = row.get("lb5mean")
     if pd.isna(lb) or pd.isna(lbm):
@@ -367,6 +376,9 @@ def pick_low_pos_entry(as_of=None, top=1500, quiet=False):
                 _os_bias = (float(row["收盘"]) / float(_os_ma20) - 1) * 100
                 if _os_bias < LOW_POS_ENTRY_SCAN_BIAS20_MIN:
                     continue  # 深埋MA20下方=下跌中继（10日启动2.32%且T5弱）
+            # 2026-09-23 晚 A 方案：超卖路径同样要求 MA20 上行（与 _蓄势通过 口径一致）
+            if LOW_POS_ENTRY_SCAN_MA20_UP and not row.get("ma20up"):
+                continue  # 20日线斜率≤0
             os_age = len(ind) - 1 - os_first_idx  # 距首次超卖交易日数
             if os_first_idx is not None and os_age < LOW_POS_ENTRY_OS_SCAN_OS_AGE_MIN:
                 continue  # 新进超卖（≤9日）反弹前夜，样本胜率33%均值-1.96%
@@ -421,6 +433,7 @@ def pick_low_pos_entry(as_of=None, top=1500, quiet=False):
             "20日振幅%": round(float(row.get("amp20") or 0), 1),
             "成交额亿": round(float(row.get("成交额") or 0) / 1e8, 2),
             "MA20": round(ma20, 2),
+            "MA20上行": bool(row.get("ma20up")),  # 2026-09-23 B 方案排序键（A 开启时恒为 True）
             "买点区间": f"{buy_lo}-{buy_hi}",
             "止损价": _stop_price,
             "触发线": _trigger_line,
@@ -445,8 +458,12 @@ def pick_low_pos_entry(as_of=None, top=1500, quiet=False):
                 ind_count[ind] = ind_count.get(ind, 0) + 1
             dedup.append(r)
         picks = dedup
-    # 排序：位置低优先 + 量比低优先（极致缩量优先）
-    picks.sort(key=lambda x: (x["60日位置"], x["量比"]))
+    # 排序（2026-09-24 用户拍板）：标准蓄势优先（近期超卖启动后T5 -2.97%/胜率35%，后置）→ 位置低 → 量比低
+    picks.sort(key=lambda x: (x["蓄势路径"] != "标准蓄势", x["60日位置"], x["量比"]))
+    # 2026-09-23 晚 B 方案：topN 截断（用户拍板「每天进池2-4只」，回放 3.52→2.16只/天）。
+    #   截断作用于返回值 → 展示/入池归档/触发检查口径统一，均为每日 topN。
+    if LOW_POS_ENTRY_TOPN and len(picks) > LOW_POS_ENTRY_TOPN:
+        picks = picks[:LOW_POS_ENTRY_TOPN]
     return picks
 
 
@@ -648,6 +665,9 @@ def backtest(top=600, days=120, min_trigger=1, codes=None, names_map=None):
                 if _bt_ma20 is not None and not pd.isna(_bt_ma20):
                     if (float(row["收盘"]) / float(_bt_ma20) - 1) * 100 < LOW_POS_ENTRY_SCAN_BIAS20_MIN:
                         continue
+                # 2026-09-23 晚 A 方案：与 pick 超卖段口径一致（MA20 上行硬过滤）
+                if LOW_POS_ENTRY_SCAN_MA20_UP and not row.get("ma20up"):
+                    continue
                 if os_first_idx is not None and (i - os_first_idx) < LOW_POS_ENTRY_OS_SCAN_OS_AGE_MIN:
                     continue
                 if float(row.get("lb") or 0) > LOW_POS_ENTRY_OS_SCAN_LB_MAX:
@@ -830,7 +850,7 @@ def main():
                     lines.append(f"· {r['名称']}({r['代码']}) 现价{r['现价']} "
                                  f"位置{r['60日位置']:.0%} 距高{r['dist60%']:.0f}% 量比{r['量比']:.2f}x "
                                  f"买点{r['买点区间']} 止损{r['止损价']}")
-                lines.append("触发条件：量比≥2.0 + 涨幅9-15% + 成交额4-16亿 → 买入，T+3/T+5止盈（标准蓄势T+3、近期超卖T+5）。仅供参考，非投资建议。")
+                lines.append("触发条件：量比≥1.5 + 涨幅9-15% + 成交额4-16亿 → 买入，T+3/T+5止盈（标准蓄势T+3、近期超卖T+5）。仅供参考，非投资建议。")
                 push_alert("低位埋伏蓄势池", "\n".join(lines))
             except Exception as e:
                 print(f"推送失败: {e}")

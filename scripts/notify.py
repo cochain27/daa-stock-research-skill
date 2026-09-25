@@ -18,7 +18,7 @@ body{font-family:-apple-system,'PingFang SC','Microsoft YaHei',sans-serif;font-s
 .rt-sec{font-size:12px;font-weight:700;color:#2c3e50;border-left:3px solid #c9a063;padding-left:6px;margin:10px 0 4px;letter-spacing:.3px;}
 .rt-sub{font-size:12px;font-weight:700;color:#5d6d7e;margin:6px 0 2px;}
 table{border-collapse:collapse;width:100%;font-size:10.5px;margin:3px 0;background:#fffdf8;}
-th{background:#f5ecdd;color:#712b13;padding:3px 4px;border:1px solid #ead9c2;text-align:left;white-space:nowrap;font-weight:600;}
+th{background:#f5ecdd;color:#712b13;padding:3px 4px;border:1px solid #ead9c2;text-align:left;white-space:normal;font-weight:600;}
 td{padding:3px 4px;border:1px solid #f2e8d8;vertical-align:top;}
 tr:nth-child(even){background:#fbf7ee;}
 .rt-quote{color:#9099a2;font-size:10.5px;border-left:2px solid #e5d5b8;padding-left:7px;margin:5px 0;}

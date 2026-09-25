@@ -247,7 +247,7 @@ def warm_tracking_rows(today):
         elif t_days >= 5:
             advice = "⏰ T+5 到期，强制离场"
         elif t_days >= 2 and below:
-            advice = "破MA5 → 次日开盘离场"
+            advice = "次日开盘离场"
         else:
             advice = "持有中"
         row.update({"现价": last, "距信号%": dist if dist == dist else None,

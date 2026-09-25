@@ -119,6 +119,9 @@ def _tech_indicators(hist):
     df = hist.copy()
     for n in (5, 10, 20, 60):
         df[f"MA{n}"] = close.rolling(n).mean()
+    # 20日均量（趋势选股器放量判定依赖，2026-09-24 修复：此前缺失导致 avg_vol20 恒 0 → 趋势池结构性 0 出票）
+    vol_col = "成交量" if "成交量" in df.columns else "volume"
+    df["AVG_VOL20"] = pd.to_numeric(df[vol_col], errors="coerce").rolling(20).mean()
     # MACD
     ema12 = close.ewm(span=12, adjust=False).mean()
     ema26 = close.ewm(span=26, adjust=False).mean()
