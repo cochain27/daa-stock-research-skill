@@ -19,33 +19,71 @@ import requests
 
 BASE = Path(__file__).resolve().parent.parent / "data" / "klines"
 HEADERS = {"User-Agent": "Mozilla/5.0", "Referer": "https://gu.qq.com/"}
+# web.ifzq.gtimg.cn 高频后触发 WAF(501page)，备用域名轮换
+API_HOSTS = [
+    "https://ifzq.gtimg.cn/appstock/app/fqkline/get",
+    "https://proxy.finance.qq.com/ifzqgtimg/appstock/app/fqkline/get",
+]
 HIST_START = "2024-01-01"
 EXCH = {"sz": "SZ", "sh": "SH", "bj": "BJ"}
 
 
 def _tencent_klines(symbol: str, start: str, end: str, count: int = 800):
-    """拉腾讯前复权日K，返回 [(date, open, close, high, low, volume手)]"""
-    s = requests.Session()
-    s.trust_env = False  # 绕过系统代理，直连国内源
-    r = s.get(
-        "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get",
-        params={"param": f"{symbol},day,{start},{end},{count},qfq"},
-        headers=HEADERS, timeout=15,
-    )
-    r.raise_for_status()
-    j = r.json()
-    d = j.get("data", {}).get(symbol, {})
-    kl = d.get("qfqday") or d.get("day") or []
-    out = []
-    for row in kl:
-        if len(row) < 6:
-            continue
+    """拉腾讯前复权日K，返回 [(date, open, close, high, low, volume手)] 多host轮换"""
+    last_err = None
+    for host in API_HOSTS:
         try:
-            out.append((row[0], float(row[1]), float(row[2]), float(row[3]),
-                        float(row[4]), float(row[5])))
-        except (ValueError, TypeError):
+            s = requests.Session()
+            s.trust_env = False  # 绕过系统代理，直连国内源
+            r = s.get(
+                host,
+                params={"param": f"{symbol},day,{start},{end},{count},qfq"},
+                headers=HEADERS, timeout=15,
+            )
+            r.raise_for_status()
+            j = r.json()
+            d = j.get("data", {}).get(symbol, {})
+            kl = d.get("qfqday") or d.get("day") or []
+            if not kl and isinstance(j.get("data"), dict) and not d:
+                raise RuntimeError("empty data")
+            out = []
+            for row in kl:
+                if len(row) < 6:
+                    continue
+                try:
+                    out.append((row[0], float(row[1]), float(row[2]), float(row[3]),
+                                float(row[4]), float(row[5])))
+                except (ValueError, TypeError):
+                    continue
+            return out
+        except Exception as e:
+            last_err = e
             continue
-    return out
+    raise last_err
+
+
+def _fetch_with_retry(symbol: str, start: str, end: str, attempts: int = 4):
+    """分页 + 重试拉取：腾讯 count=800 返回最末 800 条，
+    跨度超 ~800 交易日须按 380 日历天分段；501/网络错重试退避。"""
+    import datetime as _dt
+    rows = []
+    cur = _dt.date.fromisoformat(start)
+    end_d = _dt.date.fromisoformat(end)
+    for att in range(attempts):
+        try:
+            while cur <= end_d:
+                seg_end_d = min(cur + _dt.timedelta(days=380), end_d)
+                seg_end = seg_end_d.isoformat()
+                rows.extend(_tencent_klines(symbol, cur.isoformat(), seg_end, 800))
+                cur = seg_end_d + _dt.timedelta(days=1)
+            break
+        except Exception:
+            if att == attempts - 1:
+                raise
+            time.sleep(2 + att * 4)  # 退避 2/6/10/14s
+            rows = []  # 段内失败整体重来
+            cur = _dt.date.fromisoformat(start)
+    return rows
 
 
 def _merge_and_write(path: Path, symbol: str, new_rows, dry: bool = False):
@@ -57,8 +95,8 @@ def _merge_and_write(path: Path, symbol: str, new_rows, dry: bool = False):
         with path.open(encoding="utf-8") as f:
             rdr = csv.reader(f)
             rows = list(rdr)
-        if rows and rows[0] and rows[0][0] == "symbol":
-            header = ",".join(rows[0])
+        if rows and rows[0] and rows[0][0].lstrip("\ufeff") == "symbol":
+            header = ",".join(c.lstrip("\ufeff") for c in rows[0])
             rows = rows[1:]
         else:
             rows = rows
@@ -130,7 +168,7 @@ def main():
             continue
         end = first_date  # 补到缓存起点前（接口含end日，脚本内去重）
         try:
-            new_rows = _tencent_klines(symbol, start, end, 800)
+            new_rows = _fetch_with_retry(symbol, start, end)
         except Exception as e:
             fail += 1
             print(f"[{idx}/{len(files)}] {symbol} 拉取失败: {e}", flush=True)

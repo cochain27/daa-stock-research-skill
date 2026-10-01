@@ -5,10 +5,16 @@
 """
 import json
 import re
+import time
 from pathlib import Path
 import requests
 
 CONFIG_PATH = Path(__file__).resolve().parent.parent / "data" / "push_config.json"
+
+# PushPlus 内容长度上限：实名用户 2 万个字（未实名 0 次/会员 10 万），留 1000 字余量。
+# 2026-10-01 前这里是按 **markdown 字符数** 卡 3500，而 HTML 版面膨胀约 2.9 倍
+# （4863 字 md → 14075 字 html），远低于 2 万上限却被拦腰截断，表格还被切成半张。
+PUSHPLUS_CONTENT_MAX = 19000
 
 # 手机端样式 v5-DM：雅灰蓝骨架 + 宣纸朱砂阅读区（红涨绿跌）+ 夜间模式自适应
 _CSS = """<style>
@@ -385,10 +391,97 @@ def push_wechat(title, content, channel=None, html=False):
     return False, ch, "该渠道未配置token"
 
 
-def push_report(title, md_text, max_len=3500):
-    """推送日报类长文：转手机端紧凑HTML（超长截断，完整版看E盘文件）"""
-    body = md_text if len(md_text) <= max_len else md_text[:max_len] + "\n\n> …（超长已截断，完整版见本地推送文件）"
-    return push_wechat(title, md_to_mobile_html(body), html=True)
+def _md_sections(md):
+    """按顶层 `## ` 章节切段，返回 (首个 `# ` 标题行, [段...])。
+
+    只在章节边界切，保证不会把一张表格切成半张（旧版按字符硬切会渲染出残缺表格）。
+    """
+    head, segs, cur = None, [], []
+    for ln in md.splitlines():
+        if ln.startswith("# ") and head is None:
+            head = ln
+            continue
+        if ln.startswith("## "):
+            if cur:
+                segs.append("\n".join(cur))
+                cur = []
+        cur.append(ln)
+    if cur:
+        segs.append("\n".join(cur))
+    return head, segs
+
+
+def _pack_sections(head, segs, limit):
+    """贪心打包：相邻章节合并到不超限的最大块，返回 [md 片段...]。"""
+    packs, cur = [], []
+    for s in segs:
+        cand = cur + [s]
+        body = "\n\n".join(cand)
+        if head and not packs:
+            body = head + "\n" + body
+        if cur and len(md_to_mobile_html(body)) > limit:
+            packs.append("\n\n".join(cur))
+            cur = [s]
+        else:
+            cur = cand
+    if cur:
+        packs.append("\n\n".join(cur))
+    return packs
+
+
+def _hard_split(md, limit):
+    """单段仍超限（巨型表格）→ 按行切，兜底保证每条都进得了 PushPlus。"""
+    out, cur = [], []
+    for ln in md.splitlines():
+        if cur and len(md_to_mobile_html("\n".join(cur + [ln]))) > limit:
+            out.append("\n".join(cur))
+            cur = [ln]
+        else:
+            cur.append(ln)
+    if cur:
+        out.append("\n".join(cur))
+    return out
+
+
+def push_report(title, md_text, max_len=None, max_html_len=PUSHPLUS_CONTENT_MAX):
+    """推送日报类长文（手机端 HTML 版面）。
+
+    2026-10-01 改版：
+    - 旧版按 **md 字符数** 硬截 3500（PushPlus 实际可容 2 万字）→ 09-22 起多数日报被拦腰截断、
+      表格残缺、末尾挂「超长已截断」。
+    - 新版按 **HTML 实际长度** 判断：不超限则单条发出（标题不变）；超限则按 `## ` 章节
+      贪心打包成多条，标题带 (i/n)，每条独立可看；单段仍超限再按行切兜底。
+    - max_len 为旧参数，保留仅为兼容，不再生效。
+    """
+    limit = max_html_len or PUSHPLUS_CONTENT_MAX
+    full = md_to_mobile_html(md_text)
+    if len(full) <= limit:
+        return push_wechat(title, full, html=True)
+
+    head, segs = _md_sections(md_text)
+    chunks = []
+    for p in _pack_sections(head, segs, limit):
+        if len(md_to_mobile_html(p)) <= limit:
+            chunks.append(p)
+        else:
+            chunks.extend(_hard_split(p, limit))
+    # 条数硬上限：PushPlus 频率限制 1 分钟 5 次，超量反而丢消息
+    max_chunks = 5
+    truncated = len(chunks) > max_chunks
+    if truncated:
+        chunks = chunks[:max_chunks]
+    n = len(chunks)
+    last = None
+    for i, c in enumerate(chunks, 1):
+        body = md_to_mobile_html(c)
+        if i == n:
+            tail = ("…后续章节已省略（条数达上限），完整版见本地推送文件" if truncated
+                    else "…以上为分段推送，完整版见本地推送文件")
+            body += f'<div class="rt-quote">{tail}</div>'
+        last = push_wechat(f"{title} ({i}/{n})", body, html=True)
+        if i < n:
+            time.sleep(1.2)  # PushPlus 频率：1 分钟 5 次
+    return last
 
 
 def push_alert(title, text):

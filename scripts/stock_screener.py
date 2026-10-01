@@ -135,6 +135,19 @@ def _tech_indicators(hist):
     loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
     rs = gain / loss.replace(0, np.nan)
     df["RSI14"] = 100 - 100 / (1 + rs)
+    # 周线上扬（2026-09-28 因子挖掘落地，趋势/短线同口径，与初动池 week_up 一致）
+    # 周收盘 > 5周均线 且 5周均线上行（自然周聚合 → 映射回日线）
+    if "日期" in df.columns:
+        df["_week"] = pd.to_datetime(df["日期"]).dt.to_period("W").astype(str)
+        wk = df.groupby("_week").agg(wclose=("收盘", "last")).reset_index()
+        wk["wma5"] = wk["wclose"].rolling(5).mean()
+        wk["wma5_up"] = wk["wma5"] > wk["wma5"].shift(1)
+        wk = wk.ffill()
+        df = df.merge(wk[["_week", "wclose", "wma5", "wma5_up"]], on="_week", how="left")
+        df["week_up"] = (df["wclose"] > df["wma5"]) & df["wma5_up"]
+        df = df.drop(columns=["_week"])
+    else:
+        df["week_up"] = False
     return df
 
 
@@ -922,14 +935,28 @@ def pick_shortline_stocks(snapshot, n=2, exclude_codes=None):
             if SHORTLINE_MIN_VOL_RATIO > 0 and float(q.get("量比", 0) or 0) < SHORTLINE_MIN_VOL_RATIO:
                 continue
             # 剔除昨日涨停票（2026-09-09：避免高位接力，昨日涨停今日溢价风险大）
-            if SHORTLINE_EXCLUDE_YESTERDAY_ZT:
-                h = get_stock_hist(code, days=10)
-                if h is not None and len(h) >= 3:
-                    h = h.sort_values("日期").reset_index(drop=True)
+            # + 周线上扬硬过滤（2026-09-28 因子挖掘：短线两段同向强增量，训练44vs27%、测试50vs33%）
+            h = get_stock_hist(code, days=90)
+            if h is not None and len(h) >= 20:
+                h = h.sort_values("日期").reset_index(drop=True)
+                if SHORTLINE_EXCLUDE_YESTERDAY_ZT and len(h) >= 3:
                     c1, c2 = float(h["收盘"].iloc[-2]), float(h["收盘"].iloc[-3])
                     zt_pct = 19.5 if code.startswith("30") else 9.5
                     if c2 > 0 and (c1 / c2 - 1) * 100 >= zt_pct:
                         continue
+                # 周线特征（同 _tech_indicators 口径）
+                hw = h.copy()
+                hw["_week"] = pd.to_datetime(hw["日期"]).dt.to_period("W").astype(str)
+                wkw = hw.groupby("_week").agg(wclose=("收盘", "last")).reset_index()
+                wkw["wma5"] = wkw["wclose"].rolling(5).mean()
+                wkw["wma5_up"] = wkw["wma5"] > wkw["wma5"].shift(1)
+                wkw = wkw.ffill()
+                hw = hw.merge(wkw[["_week", "wclose", "wma5", "wma5_up"]], on="_week", how="left")
+                week_up = bool((hw["wclose"].iloc[-1] > hw["wma5"].iloc[-1]) & hw["wma5_up"].iloc[-1]) if hw["wma5"].notna().iloc[-1] else False
+                if not week_up:
+                    continue
+            else:
+                continue  # K线不足无法判定周线，不出票
 
             chg = q.get("涨跌幅", c["涨跌幅"])
             hs = q.get("换手率", c["换手率"])
@@ -1196,6 +1223,7 @@ def pick_trend_stocks(snapshot=None, boards=None, n=2, exclude_codes=None):
     4. 放量突破：今日成交量≥20日均量×TREND_BREAKOUT_VOL_RATIO(1.5倍)
     5. 突破阳线：收盘突破近20日/60日最高收盘，涨幅在TREND_BREAKOUT_CHG_RANGE(3-7%)
     6. MA共振：close > MA10 > MA20 或 MA5>MA10>MA20（多头排列）
+    6.5 周线上扬（2026-09-28 因子挖掘落地）：周收盘>5周均线 且 5周均线上行（两段同向增量，样本收缩-20%）
     7. MACD共振：DIF>DEA 且 MACD柱>0 或 近3日内金叉
     8. RSI健康：RSI(14) 在 40-70 区间（不过热）
     9. 流通市值≥TREND_MIN_MARKET_CAP（30亿）
@@ -1286,6 +1314,11 @@ def pick_trend_stocks(snapshot=None, boards=None, n=2, exclude_codes=None):
             # 条件6：MA多头排列
             ma_ok = (close > ma10 > ma20) or (ma5 > ma10 > ma20)
             if not ma_ok:
+                continue
+            # 条件6.5：周线上扬（2026-09-28 因子挖掘：趋势两段同向强增量）
+            # 训练命中 46% vs 未中 20%、测试 45% vs 25%，样本收缩仅 -20%
+            wu = last.get("week_up")
+            if pd.isna(wu) or not bool(wu):
                 continue
             # 条件7：MACD
             dif = float(last.get("DIF", 0))
@@ -1432,7 +1465,7 @@ def bottom_fishing_picks(snapshot=None, temp=30, board_zt_count=None, n=2, exclu
         if code in exclude:
             continue
         try:
-            hist = get_stock_hist(code, days=40)
+            hist = get_stock_hist(code, days=90)
             if hist is None or len(hist) < 20:
                 continue
             ind = _tech_indicators(hist)
@@ -1464,6 +1497,10 @@ def bottom_fishing_picks(snapshot=None, temp=30, board_zt_count=None, n=2, exclu
             # 条件6：RSI区间（修复 2026-09-08 bug：同趋势策略，字段应为 RSI14）
             rsi = float(last.get("RSI14", 50))
             if not (25 <= rsi <= 50):
+                continue
+            # 条件6.5：周线上扬（2026-09-28 因子挖掘落地，短线系同口径）
+            wu = last.get("week_up")
+            if pd.isna(wu) or not bool(wu):
                 continue
             # 条件4：跑输大盘（今日跌幅大于指数跌幅，简化用平均市场跌幅-2%）
             # 冰点期大盘弱势，个股只要相对强势且超卖即可

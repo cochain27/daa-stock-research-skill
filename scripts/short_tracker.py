@@ -92,6 +92,11 @@ def log_picks(picks, market_env=None):
     today = datetime.now().strftime("%Y-%m-%d")
     rows = _read_rows(TRACK_SHORT_PATH)
     existing = {(r["日期"], r["代码"]) for r in rows}
+    # 2026-09-30 修复：同一票在池期间（持有中/止盈1减半）不再重复登记新行。
+    #   此前去重键仅为 (日期, 代码)，导致已在池的票次日被重复登记 → 复盘
+    #   「短线激进池」出现同一票两行、且推荐日被错标为重复登记日（如正和生态
+    #   09-29 首推、09-30 又被登记一次，表格显示推荐日 09-30，天数/成本口径错乱）。
+    open_codes = {r["代码"] for r in rows if r["状态"] in OPEN_STATUS}
     added = 0
 
     # 尝试获取今日开盘价
@@ -105,6 +110,9 @@ def log_picks(picks, market_env=None):
     for p in picks:
         code = str(p.get("symbol", ""))
         if (today, code) in existing or not code:
+            continue
+        # 已在池（持中）的票不重复登记，保持首次推荐日与成本口径
+        if code in open_codes:
             continue
         if not code.startswith(ALLOW_CODE_PREFIX):
             continue
@@ -359,8 +367,8 @@ def analyze_track_pool():
             "持有天数": days, "基准价": base, "现价": price,
             "当日涨跌%": q.get("涨跌幅"), "累计盈亏%": round(ret, 2),
             "最高收益%": round(peak, 2), "状态": r["状态"],
-            "止损价": sl, "止盈1": target_tp1, "止盈2": target_tp2,
-            "更新止损": sl, "更新止盈1": target_tp1, "更新止盈2": target_tp2,
+            "止损价": round(sl, 2), "止盈1": target_tp1, "止盈2": target_tp2,
+            "更新止损": round(sl, 2), "更新止盈1": target_tp1, "更新止盈2": target_tp2,
             "建议": advice, "标记": flag,
             "情绪分": r.get("情绪分", ""),
             "连板数": r.get("连板数", ""),

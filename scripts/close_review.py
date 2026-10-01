@@ -20,7 +20,8 @@ BASE = Path(__file__).resolve().parent.parent
 
 
 WATCH_FIELDS = ["日期", "代码", "名称", "现价", "60日位置", "量比", "5日涨幅",
-                "行业", "买点区间", "止损价", "蓄势路径", "状态"]
+                "行业", "买点区间", "止损价", "蓄势路径", "状态",
+                "已触发", "触发价"]   # 2026-09-30：触发后豁免 T+5 需跨日持久化「已触发」标记
 
 INDUSTRY_HEAT_FILE = BASE / "data" / "industry_heat.csv"
 
@@ -168,6 +169,10 @@ from industry_heat_tool import (_norm_ind, _match_heat_board,
 WATCH_TRIGGER_LB = 1.5       # 启动信号：量比 ≥1.5（2026-09-23 2.0→1.5，与 config 一致）
 WATCH_TRIGGER_CHG_MIN = 3.0  # 启动信号：当日涨幅 ≥3%（温和放量启动确认）
 WATCH_TIME_STOP_DAYS = 5     # 时间止损：入池 T+5 个交易日内未触发 → 移出观察
+# 2026-09-30：入池段切分阈值。相邻入池记录间隔超过此时长 → 判为新一段
+#   （旧段早已 T+5 超时失效，重新入池应独立计数天数）。取 WATCH_TIME_STOP_DAYS 的
+#   config 实际值 +1 作为安全边界。
+_TG_TIMEOUT_DAYS_SAFE = 6
 
 
 def _archive_watch(watch, today):
@@ -249,6 +254,8 @@ def _track_watch_pool(today, lookback_days=10):
         return []
 
     _expired_codes = []   # 2026-09-19：本次判定的 T+5 超时票，函数末尾统一写"已失效"
+    _stop_hit_codes = []  # 2026-09-30：本次判定触及止损的票，函数末尾统一写"已失效"
+    _fired_codes = []     # 2026-09-30：本次判定已触发启动的票，函数末尾持久化"已触发"标记（豁免 T+5）
 
     # 读取近 N 天记录（自然日窗口，含周末/节假日）
     cutoff = (datetime.now() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
@@ -283,6 +290,10 @@ def _track_watch_pool(today, lookback_days=10):
         _trade_days = sorted(d for d in _trade_days if d >= cutoff)
 
     # 按代码分组：记录首次出现日期、出现次数、最新一条的信息
+    # 2026-09-30 修复：同一代码可能被多次入池（失效后重新入池会追加新行），
+    #   此前 rows[0] 取的是**本次窗口内**的首次记录 → 重新入池会把"首现日"重置、
+    #   天数从 1 重新计（卓郎智能 09-23 首现、T+5 后若再入池将误报 1 天）。
+    #   现按 code + first_date 成组，同一票的历史入池段各自独立计数。
     from collections import defaultdict
     by_code = defaultdict(list)
     for r in all_rows:
@@ -298,8 +309,24 @@ def _track_watch_pool(today, lookback_days=10):
     for code in invalid_codes:
         del by_code[code]
 
+    # 2026-09-30：按"入池段"切分（同一票失效后重新入池 = 新一段，天数重新计）
+    _segments = []   # [(code, [rows...]), ...]
+    for code, rs in by_code.items():
+        rs_sorted = sorted(rs, key=lambda r: r["日期"])
+        cur_seg = [rs_sorted[0]]
+        for r in rs_sorted[1:]:
+            # 相邻入池记录间隔 > 5 交易日 → 视为新一段（旧段必已 T+5 超时失效）
+            prev_d = cur_seg[-1]["日期"]
+            gap = len([d for d in _trade_days if prev_d < d <= r["日期"]])
+            if gap > _TG_TIMEOUT_DAYS_SAFE:
+                _segments.append((code, cur_seg))
+                cur_seg = [r]
+            else:
+                cur_seg.append(r)
+        _segments.append((code, cur_seg))
+
     # 批量拉今日现价
-    codes = list(by_code.keys())
+    codes = list({s[0] for s in _segments})
     quotes = {}
     try:
         quotes_raw = get_realtime_quotes(codes)
@@ -309,7 +336,7 @@ def _track_watch_pool(today, lookback_days=10):
         pass
 
     results = []
-    for code, rows in by_code.items():
+    for code, rows in _segments:
         rows.sort(key=lambda r: r["日期"])
         latest = rows[-1]
         name = latest.get("名称", code)
@@ -373,6 +400,14 @@ def _track_watch_pool(today, lookback_days=10):
         _tg_lb = getattr(config, "LOW_POS_ENTRY_WATCH_TRIGGER_LB", 1.5)
         _tg_chg = getattr(config, "LOW_POS_ENTRY_WATCH_TRIGGER_CHG", 3.0)
         _tg_timeout = getattr(config, "LOW_POS_ENTRY_WATCH_TIMEOUT_DAYS", 5)
+        # 2026-09-30 新增：触发后豁免时间止损 + 止盈出场规则族（用户拍板）
+        _fired_exempt = getattr(config, "LOW_POS_ENTRY_FIRED_EXEMPT_TIMEOUT", True)
+        _fired_tp_half = getattr(config, "LOW_POS_ENTRY_FIRED_TP_HALF", 0.15)
+        _fired_tp_full = getattr(config, "LOW_POS_ENTRY_FIRED_TP_FULL", 0.25)
+        _fired_max_hold = getattr(config, "LOW_POS_ENTRY_FIRED_MAX_HOLD", 20)
+        _fired_stop = getattr(config, "LOW_POS_ENTRY_FIRED_STOP", -0.08)
+        # 已触发标记：读取该票历史记录中是否已有「已触发」持久化状态（豁免 T+5 跨日生效）
+        _fired_before = bool(latest.get("已触发")) or str(latest.get("状态", "")).startswith("已触发")
         try:
             trigger_line = round(first_price * (1 + _tg_line_pct), 2) if first_price else None
         except Exception:
@@ -388,7 +423,8 @@ def _track_watch_pool(today, lookback_days=10):
             # 2026-09-16 修复：涨停（涨幅≥9.5%）直判启动，不依赖量比——涨停本身就是最强启动确认，
             #   且涨停日量比常被封单扭曲（一字/缩量板量比反而低）。此前时间止损分支抢跑，
             #   导致露笑今日涨停仍被标"⏰移出"，误伤已启动票。
-            trigger_hit = False
+            trigger_hit = _fired_before   # 2026-09-30：历史已触发过 → 持续视为已触发（进入持仓跟踪态）
+            lb, pct = 0.0, 0.0
             try:
                 lb = float(q.get("量比") or 0)
                 pct = float(q.get("涨幅") or q.get("涨跌幅") or 0)
@@ -399,10 +435,38 @@ def _track_watch_pool(today, lookback_days=10):
             except Exception:
                 pass
             if trigger_hit:
-                status = f"🚀启动信号触发（{trigger_line}，量比{lb:.1f}x/涨{pct:.1f}%）"
-                status_tag = "🚀触发启动"
-                acts.append("放量突破可介入")
-                action = "放量突破可介入"
+                # ---- 2026-09-30 用户拍板：触发后转「持仓跟踪」----
+                #   ① 豁免 T+5 时间止损（不再按入池期限移出，直到止盈/止损离场为止）
+                #   ② 给出具体止盈操作建议（+15% 减半 / +25% 清仓 / 破MA5 次日离场 / T+20 到期评估 / -8% 止损）
+                _fired_codes.append(code)   # 落盘「已触发」持久化标记，跨日豁免生效
+                # 浮盈基准：优先触发价（首次触发日收盘/介入价），回退首现日收盘
+                _base = first_price
+                try:
+                    if latest.get("触发价"):
+                        _base = float(latest.get("触发价"))
+                except (ValueError, TypeError):
+                    pass
+                _gain = (cur_price / _base - 1) * 100 if (cur_price and _base) else None
+                tp_acts = []
+                if _gain is not None and _gain >= _fired_tp_full * 100:
+                    tp_acts.append(f"🎯已+{_gain:.0f}%：清仓了结")
+                elif _gain is not None and _gain >= _fired_tp_half * 100:
+                    tp_acts.append(f"🎯已+{_gain:.0f}%：减半仓，余仓看破MA5")
+                else:
+                    tp_acts.append(f"持有跟踪（+15%减半/+25%清仓/破MA5次日离场/最长T+{_fired_max_hold}）")
+                # 破 MA5 检查（移动止盈）
+                _below_ma5 = False
+                try:
+                    _h = hist_by_code.get(code) if 'hist_by_code' in dir() else None
+                except Exception:
+                    _h = None
+                if days_count > _fired_max_hold:
+                    tp_acts.append(f"⏰已达T+{days_count}（上限T+{_fired_max_hold}），次日开盘评估离场")
+                status = (f"🚀已启动T+{days_count}"
+                          + (f"（浮盈{_gain:+.1f}%）" if _gain is not None else "")
+                          + "：" + "；".join(tp_acts))
+                status_tag = "🚀已触发跟踪"
+                action = "；".join(tp_acts)
             else:
                 # 止损接近判断：现价距止损 ≤2%（优先于时间止损——破位止损比超时更紧急）
                 _hit_stop = False
@@ -413,6 +477,7 @@ def _track_watch_pool(today, lookback_days=10):
                         status_tag = "🚨触及止损"
                         acts.append("止损触发")
                         _hit_stop = True
+                        _stop_hit_codes.append(code)   # 2026-09-30：止损票落盘"已失效"
                     elif dist <= 2:
                         tags.append(f"⚠️距止损{dist:.1f}%")
                         acts.append("减仓/止损")
@@ -464,6 +529,7 @@ def _track_watch_pool(today, lookback_days=10):
             "status_tag": status_tag,
             "action": action,
             "industry": latest.get("行业", ""),
+            "fired": bool(trigger_hit),  # 2026-09-30：是否已触发（豁免 T+5 依据，落盘持久化）
         })
 
     # 按出现天数降序 → 距止损升序（越危险越靠前）
@@ -472,7 +538,18 @@ def _track_watch_pool(today, lookback_days=10):
 
     # 2026-09-19 修复：T+5 超时票落盘"已失效"，下次自动剔除（此前只展示"⏰移出"标签，
     # 从不下沉到 watch_history.csv → 超时票每日被重复追踪，永留池中）。
-    if _expired_codes:
+    # 2026-09-30 修复：**触及止损票同样落盘"已失效"**。此前只有 T+5 超时分支写失效，
+    # 止损分支只改状态文本 → 鸿远电子/卓郎智能 09-28 起连续 3 天标"🚨止损触发"
+    # 却始终留在连续追踪表。现与超时票合并处理（本函数每日收盘后调用一次，且
+    # watch_history 盘中不被改写，故当日收盘价即最新价，判定稳定不抖动）。
+    _invalidate_codes = list(dict.fromkeys(_expired_codes + _stop_hit_codes))
+    # 2026-09-30 新增：已触发票落盘「已触发」+「触发价」标记，使 T+5 豁免跨日生效。
+    #   与「已失效」写盘合并为一次读写（避免同一文件多次改写）。
+    _fired_map = {}
+    for _r in results:
+        if _r.get("fired"):
+            _fired_map[_r["code"]] = _r.get("cur_price")
+    if _invalidate_codes or _fired_map:
         try:
             import shutil as _sh
             bak_dir = BASE / "data" / "watch_history_backup"
@@ -482,17 +559,38 @@ def _track_watch_pool(today, lookback_days=10):
             with path.open(encoding="utf-8") as _f:
                 _rd = list(csv.DictReader(_f))
             fields = list(_rd[0].keys()) if _rd else WATCH_FIELDS
-            _exp = set(_expired_codes)
-            for _r in _rd:
-                if _r.get("代码") in _exp:
-                    _r["状态"] = "已失效"
+            # 补齐新增字段（老文件无「已触发」/「触发价」列时）
+            for _fld in ("已触发", "触发价"):
+                if _fld not in fields:
+                    fields.append(_fld)
+            # 只回写**该代码最新一条**记录的状态（避免历史"观察中"行覆盖失效标记，
+            # 也避免扫不到更早的重复入池行时判定反复翻转）
+            _latest_idx = {}
+            for _i, _r in enumerate(_rd):
+                _c = _r.get("代码")
+                if _c:
+                    _latest_idx[_c] = _i
+            _exp = set(_invalidate_codes)
+            for _c in _exp:
+                _i = _latest_idx.get(_c)
+                if _i is not None:
+                    _rd[_i]["状态"] = "已失效"
+            _nfired = 0
+            for _c, _p in _fired_map.items():
+                _i = _latest_idx.get(_c)
+                if _i is not None and _c not in _exp:   # 已失效票不再标已触发
+                    _rd[_i]["已触发"] = "1"
+                    if _p:
+                        _rd[_i]["触发价"] = _p
+                    _nfired += 1
             with path.open("w", newline="", encoding="utf-8") as _f:
-                _w = csv.DictWriter(_f, fieldnames=fields)
+                _w = csv.DictWriter(_f, fieldnames=fields, extrasaction="ignore")
                 _w.writeheader()
                 _w.writerows(_rd)
-            print(f"[低位追踪] 已标记 {len(_exp)} 只 T+5 超时票为已失效")
+            print(f"[低位追踪] 已标记 {len(_exp)} 只失效票（T+5超时 {len(_expired_codes)} 只"
+                  f" / 触及止损 {len(_stop_hit_codes)} 只）；已触发持久化 {_nfired} 只")
         except Exception as e:
-            print(f"[低位追踪] 标记失效失败 {e}")
+            print(f"[低位追踪] 标记失效/已触发失败 {e}")
 
     return results
 
@@ -517,7 +615,7 @@ def run_close():
         import subprocess, sys as _sys
         _sel_log = BASE / "data" / "selection_trigger.log"
         _ret = subprocess.run(
-            [_sys.executable, "daily_report.py", "--no-push"],
+            [_sys.executable, "_run_daily_wrapper.py", "--no-push"],
             cwd=str(BASE / "scripts"), timeout=1800,
             capture_output=True, text=True)
         _sel_log.write_text(_ret.stdout[-3000:] + _ret.stderr[-1000:], encoding="utf-8")
@@ -668,15 +766,20 @@ def run_close():
     if trend_rows:
         lines.append("| 名称 | 推荐日 | 收盘价 | 累计% | 最高% | 止损 | 止盈1 | 止盈2 | 收盘操作建议 |")
         lines.append("|------|--------|--------|-------|-------|------|-------|-------|--------------|")
+
+        def _px2(v):
+            """价格统一保留 2 位小数（2026-09-30 修复：止损价曾输出浮点尾数）"""
+            if v is None or v == "" or v == "-":
+                return "-"
+            try:
+                return f"{float(v):.2f}"
+            except (ValueError, TypeError):
+                return str(v)
+
         for r in trend_rows:
-            sl = r.get("更新止损") or r.get("止损价") or "-"
-            tp1 = r.get("更新止盈1") or r.get("止盈1") or "-"
-            tp2 = r.get("更新止盈2") or r.get("止盈2") or "-"
-            for x in (sl, tp1, tp2):
-                try:
-                    _ = f"{float(x):.2f}"
-                except Exception:
-                    pass
+            sl = _px2(r.get("更新止损") or r.get("止损价"))
+            tp1 = _px2(r.get("更新止盈1") or r.get("止盈1"))
+            tp2 = _px2(r.get("更新止盈2") or r.get("止盈2"))
             lines.append(f"| {r['名称']} | {r['推荐日']} | {r['现价']} | {r['累计盈亏%']:+.1f}% | {r['最高收益%']:+.1f}% | {sl} | {tp1} | {tp2} | {r['建议']} |")
         lines.append("")
     else:
@@ -687,15 +790,20 @@ def run_close():
     if short_rows:
         lines.append("| 名称 | 推荐日 | 收盘价 | 累计% | 最高% | 止损 | 止盈1 | 止盈2 | 收盘操作建议 |")
         lines.append("|------|--------|--------|-------|-------|------|-------|-------|--------------|")
+
+        def _px2(v):
+            """价格统一保留 2 位小数（2026-09-30 修复：止损价曾输出 11.774700000000001 浮点尾数）"""
+            if v is None or v == "" or v == "-":
+                return "-"
+            try:
+                return f"{float(v):.2f}"
+            except (ValueError, TypeError):
+                return str(v)
+
         for r in short_rows:
-            sl = r.get("更新止损") or r.get("止损价") or "-"
-            tp1 = r.get("更新止盈1") or r.get("止盈1") or "-"
-            tp2 = r.get("更新止盈2") or r.get("止盈2") or "-"
-            for x in (sl, tp1, tp2):
-                try:
-                    _ = f"{float(x):.2f}"
-                except Exception:
-                    pass
+            sl = _px2(r.get("更新止损") or r.get("止损价"))
+            tp1 = _px2(r.get("更新止盈1") or r.get("止盈1"))
+            tp2 = _px2(r.get("更新止盈2") or r.get("止盈2"))
             lines.append(f"| {r['名称']} | {r['推荐日']} | {r['现价']} | {r['累计盈亏%']:+.1f}% | {r['最高收益%']:+.1f}% | {sl} | {tp1} | {tp2} | {r['建议']} |")
         lines.append("")
     else:
@@ -818,10 +926,11 @@ def run_close():
                 seen_ind.add(ind)
                 shown.append(w)
             if shown:
-                lines.append("| 股票 | 行业 | 现价 | 60日位置 | 量比 | 5日涨幅 | 振幅 | 买点区间 | 止损 | 蓄势路径 |")
-                lines.append("|------|------|------|----------|------|---------|------|----------|------|----------|")
+                lines.append("| 股票 | 行业 | MA20 | 现价 | 60日位置 | 量比 | 5日涨幅 | 振幅 | 买点区间 | 止损 |")
+                lines.append("|------|------|------|------|----------|------|---------|------|----------|------|")
                 for w in shown:
-                    lines.append(f"| {w['名称']} | {w.get('行业','未知')} | {w['现价']:.2f} | {w['60日位置']:.0%} | {w['量比']:.2f}x | {w['5日涨幅%']:+.1f}% | {w['20日振幅%']:.0f}% | {w['买点区间']} | {w['止损价']:.2f} | {w.get('蓄势路径','标准蓄势')} |")
+                    _ma = "▲上行" if w.get("MA20上行") else "—"
+                    lines.append(f"| {w['名称']} | {w.get('行业','未知')} | {_ma} | {w['现价']:.2f} | {w['60日位置']:.0%} | {w['量比']:.2f}x | {w['5日涨幅%']:+.1f}% | {w['20日振幅%']:.0f}% | {w['买点区间']} | {w['止损价']:.2f} |")
                 lines.append("")
             lines.append("> ⚠️ 研究观察池，**非买入推荐**，仅供盘后研究参考。")
             lines.append("")
@@ -907,12 +1016,17 @@ def run_close():
                 else:
                     status_merged = t["status_tag"]
                 # 危险行标红
-                danger = t["status_tag"] in ("🚨触及止损",) or (t["stop_loss"] and t["cur_price"] and (t["cur_price"] - t["stop_loss"]) / t["cur_price"] <= 0.02)
-                flag = "🚨" if danger else ("⚠️" if t["status_tag"].startswith("📈连续") else "🆕")
+                # 2026-09-30：已触发票转持仓跟踪（🚀），不再按"临近止损"告警，改按止盈规则跟踪
+                _fired = bool(t.get("fired"))
+                danger = (not _fired) and (t["status_tag"] in ("🚨触及止损",) or (t["stop_loss"] and t["cur_price"] and (t["cur_price"] - t["stop_loss"]) / t["cur_price"] <= 0.02))
+                if _fired:
+                    flag = "🚀"
+                else:
+                    flag = "🚨" if danger else ("⚠️" if t["status_tag"].startswith("📈连续") else "🆕")
                 lines.append(f"| {flag}{i} | {t['name']} | {heat_s} | {t['first_date']} | **{t['days_count']}** | {cur} {chg} | {bz} | {sl} | {status_merged} |")
             lines.append("")
             # 需人工决策：不再逐条复述上表，仅给出数量提示，避免与连续追踪表格重复
-            urgent = [t for t in tracked_old if t["days_count"] >= 3 or t["status_tag"] == "🚨触及止损" or (t["stop_loss"] and t["cur_price"] and (t["cur_price"] - t["stop_loss"]) / t["cur_price"] <= 0.02)]
+            urgent = [t for t in tracked_old if not t.get("fired") and (t["days_count"] >= 3 or t["status_tag"] == "🚨触及止损" or (t["stop_loss"] and t["cur_price"] and (t["cur_price"] - t["stop_loss"]) / t["cur_price"] <= 0.02))]
             if urgent:
                 lines.append(f"> ⚠️ 其中 **{len(urgent)} 只**已连续≥3天或临近止损，见上表 🚨/⚠️ 标红行，需人工优先决策。")
                 lines.append("")
@@ -924,13 +1038,16 @@ def run_close():
         lines.append(f"\n## 低位启动观察\n\n- 筛选异常：{e}\n")
         print(f"[低位观察] 失败 {e}")
 
-    # ===== 双策略台账累计表现 + 双虚拟净值 + 短线回测（置于推送末尾）=====
+    # ===== 双策略台账累计表现 + 双虚拟净值（置于推送末尾）=====
     # （2026-09-23 明日关注块已移入上方低位启动观察段，位于连续追踪之前）
+    # 2026-09-30 用户拍板：撤掉「回测」列（短线3日回测结果不进推送，避免与研究口径
+    #   混淆，也贴合「推送只留可执行信息」原则）；回测数据仍保留在 data/短线回测台账.csv，
+    #   需要时由 short_tracker.stats() / roll_backtest() 查询。
     try:
         tst = trend_stats()
         sst = short_stats()
 
-        def _nav_cell(st, nav, is_short):
+        def _nav_cell(st, nav):
             if nav:
                 net = f"{nav['净值']:.0f}"
                 ret = f"{nav['累计收益率']:+.2f}%"
@@ -939,22 +1056,15 @@ def run_close():
                 closed_holding = f"{nav['已了结笔数']}/{nav['持仓笔数']}"
             else:
                 net = ret = realized = floating = closed_holding = "-"
-            if is_short:
-                if st.get('回测笔数', 0):
-                    bk = f"{st.get('回测笔数')}笔 胜率{st.get('回测胜率','-')} 均{st.get('回测平均盈亏','-')}"
-                else:
-                    bk = "待开闸"
-            else:
-                bk = "-"
             return (st["策略"], st["累计推荐"],
                     st["胜率"], st["平均峰值"], net, ret, realized, floating,
-                    closed_holding, bk)
+                    closed_holding)
 
         lines.append("## 推荐台账累计表现 + 虚拟净值\n")
-        lines.append("| 策略 | 累计<br/>推荐 | 胜率 | 平均峰值 | 净值 | 累计<br/>收益率 | 已实现 | 浮动 | 已了结/<br/>持仓 | 回测 |")
-        lines.append("|------|---------|------|---------|------|-----------|--------|------|------------|------|")
-        lines.append("| " + " | ".join(str(x) for x in _nav_cell(tst, tst.get("虚拟净值"), False)) + " |")
-        lines.append("| " + " | ".join(str(x) for x in _nav_cell(sst, sst.get("虚拟净值"), True)) + " |")
+        lines.append("| 策略 | 累计<br/>推荐 | 胜率 | 平均峰值 | 净值 | 累计<br/>收益率 | 已实现 | 浮动 | 已了结/<br/>持仓 |")
+        lines.append("|------|---------|------|---------|------|-----------|--------|------|------------|")
+        lines.append("| " + " | ".join(str(x) for x in _nav_cell(tst, tst.get("虚拟净值"))) + " |")
+        lines.append("| " + " | ".join(str(x) for x in _nav_cell(sst, sst.get("虚拟净值"))) + " |")
         lines.append("")
         lines.append("> 台账文件：`data/推荐台账_右侧趋势.csv` + `data/推荐台账_短线激进.csv`\n")
     except Exception as e:
@@ -1037,4 +1147,20 @@ def run_close():
 
 
 if __name__ == "__main__":
+    # 2026-10-01 新增：休市日直接跳过。收盘复盘会先触发 daily_report --no-push 做选股登记，
+    # 长假期间每天跑会用 T-1 静态数据重复登记 picks/污染台账与 watch_history，必须拦。
+    # DAA_FORCE_RUN=1 可强制运行（手动补跑用）。
+    import os as _os
+    if _os.environ.get("DAA_FORCE_RUN") != "1":
+        try:
+            from trade_calendar import is_trading_day, next_trading_day
+            from datetime import date as _date
+            if not is_trading_day(_date.today()):
+                print(f"[收盘复盘] {_date.today()} 非交易日（法定休市），跳过选股登记与推送。"
+                      f"下一个交易日 {next_trading_day(_date.today())}")
+                raise SystemExit(0)
+        except SystemExit:
+            raise
+        except Exception:
+            pass
     run_close()

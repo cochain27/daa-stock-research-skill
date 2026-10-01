@@ -5,6 +5,7 @@
 import json
 from datetime import datetime
 from pathlib import Path
+import requests
 from fetch_data import get_realtime_quotes
 
 BASE = Path(__file__).resolve().parent.parent
@@ -24,7 +25,27 @@ def _save(path, obj):
     Path(path).write_text(json.dumps(obj, ensure_ascii=False, indent=1), encoding="utf-8")
 
 
+def _is_trading_day():
+    """行情源最新时间戳日期 == 今日 → 交易日。节假日/休市时行情停在上一个交易日收盘。
+
+    2026-10-01 修复：脚本无交易日校验，国庆假期用 09-30 收盘价触发并误推微信。
+    """
+    try:
+        s = requests.Session()
+        s.trust_env = False
+        r = s.get("https://qt.gtimg.cn/q=sh000001", timeout=10)
+        r.encoding = "gbk"
+        f = r.text.split("~")
+        ts = f[30] if len(f) > 30 else ""
+        return bool(ts) and ts[:8] == datetime.now().strftime("%Y%m%d")
+    except Exception:
+        return True   # 取不到行情时不做拦截，交下游逻辑判断
+
+
 def run_monitor():
+    if not _is_trading_day():
+        print("【盘中监控】非交易日（行情停留于上一交易日收盘），跳过")
+        return
     today = datetime.now().strftime("%Y-%m-%d")
     picks = _load(PICKS_PATH, [])
     state = _load(STATE_PATH, {})
@@ -166,4 +187,19 @@ def run_monitor():
 
 
 if __name__ == "__main__":
+    # 2026-10-01 新增：休市日直接跳过（自动化 rrule 只看周一至周五，无交易日历）。
+    # DAA_FORCE_RUN=1 可强制运行（手动调试用）。
+    import os as _os
+    if _os.environ.get("DAA_FORCE_RUN") != "1":
+        try:
+            from trade_calendar import is_trading_day, next_trading_day
+            from datetime import date as _date
+            if not is_trading_day(_date.today()):
+                print(f"[盘中监控] {_date.today()} 非交易日（法定休市），跳过。"
+                      f"下一个交易日 {next_trading_day(_date.today())}")
+                raise SystemExit(0)
+        except SystemExit:
+            raise
+        except Exception:
+            pass
     run_monitor()

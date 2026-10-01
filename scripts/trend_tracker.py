@@ -60,10 +60,14 @@ def log_picks(picks, market_env=None):
     today = datetime.now().strftime("%Y-%m-%d")
     rows = _read_rows(TRACK_TREND_PATH)
     existing = {(r["日期"], r["代码"]) for r in rows}
+    # 2026-09-30 修复：已在池（持有中/展期中）的票不重复登记，避免推荐日被错标为重复登记日
+    open_codes = {r["代码"] for r in rows if r["状态"] in OPEN_STATUS}
     added = 0
     for p in picks:
         code = str(p.get("symbol", ""))
         if (today, code) in existing or not code:
+            continue
+        if code in open_codes:
             continue
         if not code.startswith(ALLOW_CODE_PREFIX):
             continue
@@ -252,8 +256,8 @@ def analyze_track_pool():
             "持有天数": days, "基准价": base, "现价": price,
             "当日涨跌%": q.get("涨跌幅"), "累计盈亏%": round(ret, 2),
             "最高收益%": round(peak, 2), "状态": r["状态"], "展期": is_extended,
-            "止损价": sl, "止盈1": "", "止盈2": "",
-            "更新止损": sl, "更新止盈1": "", "更新止盈2": "",
+            "止损价": round(sl, 2), "止盈1": "", "止盈2": "",
+            "更新止损": round(sl, 2), "更新止盈1": "", "更新止盈2": "",
             "建议": advice, "标记": flag,
             "横盘天数": r.get("横盘天数", ""),
             "突破类型": r.get("突破类型", ""),

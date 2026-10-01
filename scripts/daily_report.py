@@ -278,7 +278,7 @@ def generate_full_report(temp, details, pos_advice, boards, picks, rps_rows=None
     # 2026-09-23 晚版面调整（用户拍板）：交易规则+口径脚注整体移出推送（操作信息已由表格列覆盖，口径入台账）
 
     # 低位埋伏候选池（观察池）—— 2026-09-12 新增
-    # ⚠️ 本池为研究观察工具，非买入推荐。两路径并存（标准蓄势+近期超卖），仅供盘后复盘研究参考。
+    # ⚠️ 本池为研究观察工具，非买入推荐。2026-09-30 起单路径（近期超卖路径已停用），仅供盘后研究参考。
     # 2026-09-21 版面重构：低位候选/连续追踪/风控提醒合并为「04 · 低位启动观察」三子段
     lines.append("## 04 · 低位启动观察\n")
     lines.append("### (1) 今日低位埋伏候选\n")
@@ -286,10 +286,11 @@ def generate_full_report(temp, details, pos_advice, boards, picks, rps_rows=None
         lines.append("> 今日无低位埋伏候选（T-1 蓄势形态扫描结果）。\n")
     else:
         lines.append("> ⚠️ **研究观察池**，**非买入推荐**，仅供盘后研究参考。\n")
-        lines.append("| # | 名称 | 路径 | 现价 | 60日位置 | 距高% | 量比 | 成交额亿 | 止损 |")
+        lines.append("| # | 名称 | MA20 | 现价 | 60日位置 | 距高% | 量比 | 成交额亿 | 止损 |")
         lines.append("|---|------|------|------|----------|-------|------|----------|------|")
         for i, p in enumerate(low_pos_picks, 1):
-            path_icon = "📉超卖" if p.get("蓄势路径") == "近期超卖" else "📊蓄势"
+            # 2026-09-30 方案C：MA20 上行作排序优先键（软排序），展示「▲上行/—」供人工参考
+            ma_icon = "▲上行" if p.get("MA20上行") else "—"
             close = p.get("现价", "-")
             pos60 = p.get("60日位置", "-")
             dist60 = p.get("dist60%", "-")
@@ -308,7 +309,7 @@ def generate_full_report(temp, details, pos_advice, boards, picks, rps_rows=None
             except: pass
             try: sl = f"{float(sl):.2f}"
             except: pass
-            lines.append(f"| {i} | {p['名称']}({p['代码']}) | {path_icon} | {close} | {pos60} | {dist60} | {lb} | {amt} | {sl} |")
+            lines.append(f"| {i} | {p['名称']} | {ma_icon} | {close} | {pos60} | {dist60} | {lb} | {amt} | {sl} |")
         lines.append("")
         lines.append("> 明日关注：若量比≥1.5x + 涨幅9-15% + 成交额4-16亿 + 突破MA20 → 可能触发买入信号（届时再做决策）\n")
 
@@ -345,11 +346,16 @@ def generate_full_report(temp, details, pos_advice, boards, picks, rps_rows=None
                 status_merged = f"{t['status_tag']}·{act}"
             else:
                 status_merged = t["status_tag"]
-            danger = t["status_tag"] in ("🚨触及止损",) or (t["stop_loss"] and t["cur_price"] and (t["cur_price"] - t["stop_loss"]) / t["cur_price"] <= 0.02)
-            flag = "🚨" if danger else ("⚠️" if t["status_tag"].startswith("📈连续") else "🆕")
+            # 2026-09-30：已触发票转持仓跟踪，不再按"临近止损"告警（改按止盈规则跟踪）
+            _fired = bool(t.get("fired"))
+            danger = (not _fired) and (t["status_tag"] in ("🚨触及止损",) or (t["stop_loss"] and t["cur_price"] and (t["cur_price"] - t["stop_loss"]) / t["cur_price"] <= 0.02))
+            if _fired:
+                flag = "🚀"
+            else:
+                flag = "🚨" if danger else ("⚠️" if t["status_tag"].startswith("📈连续") else "🆕")
             lines.append(f"| {flag} {t['name']} | {heat_tag} | {t['first_date']} | **{t['days_count']}** | {cur} {chg} | {bz} | {sl} | {status_merged} |")
         lines.append("")
-        urgent = [t for t in low_old if t["days_count"] >= 3 or t["status_tag"] == "🚨触及止损" or (t["stop_loss"] and t["cur_price"] and (t["cur_price"] - t["stop_loss"]) / t["cur_price"] <= 0.02)]
+        urgent = [t for t in low_old if not t.get("fired") and (t["days_count"] >= 3 or t["status_tag"] == "🚨触及止损" or (t["stop_loss"] and t["cur_price"] and (t["cur_price"] - t["stop_loss"]) / t["cur_price"] <= 0.02))]
         if urgent:
             lines.append(f"> ⚠️ 其中 **{len(urgent)} 只**已连续≥3天或临近止损，见上表 🚨/⚠️ 行，需人工优先决策。")
             lines.append("")

@@ -226,6 +226,26 @@ def warm_tracking_rows(today):
             continue  # T+5 已过，清除（记录在流水表）
         last = closes[-1]
         sig_close = closes[sig_idx]
+        # 2026-10-01 修复：离场类信号（硬止损 / T+5到期 / 破MA5）只在首次触发日展示一次，
+        # 次日及以后移出跟踪表（流水表永久保留）。此前只按 t_days>6 清除，导致"应离场"僵尸行
+        # 每天重复出现（09-30 复盘已提示离场，10-01 晨报仍在列）。
+        first_exit = None
+        for i in range(sig_idx + 1, len(closes)):
+            td = i - sig_idx
+            c = closes[i]
+            if sig_close and (c / sig_close - 1) * 100 <= -8:
+                first_exit = i
+                break
+            if td >= 5:
+                first_exit = i
+                break
+            if td >= 2 and i >= 4:
+                ma5_i = sum(closes[i - 4:i + 1]) / 5
+                if c < ma5_i:
+                    first_exit = i
+                    break
+        if first_exit is not None and first_exit < len(closes) - 1:
+            continue  # 已在昨日或更早触发离场 → 移出
         # 最高浮盈%：T+1（信号日次日）以来最高价 / 信号日收盘 - 1（2026-09-23 新增）
         peak = None
         if "最高" in df.columns:

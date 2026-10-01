@@ -199,6 +199,25 @@ except Exception as e:  # pragma: no cover
 faulthandler.dump_traceback_later(DUMP_INTERVAL, exit=False, repeat=True)
 
 SCRIPT_DIR = "/Users/chenyuting/Documents/workbuddy/workbuddy-daa/daa-stock-research-skill/scripts"
+
+# ---- 7. 休市日跳过（2026-10-01 新增）----
+# 自动化 rrule 只按周一至周五触发，无交易日历 → 国庆/春节等长假会用 T-1 静态数据重复出报告。
+# 这里按上交所休市安排判断，非交易日直接退出（不生成报告、不推送）。
+# 判据失效（无日历数据/异常）时默认按交易日处理，宁可多跑不漏跑。
+try:
+    sys.path.insert(0, SCRIPT_DIR)
+    from trade_calendar import is_trading_day, next_trading_day
+    from datetime import date as _date
+    _today = _date.today()
+    if not is_trading_day(_today):
+        print(f"[wrapper] {_today} 非交易日（法定休市），跳过日报生成与推送。"
+              f"下一个交易日 {next_trading_day(_today)}")
+        sys.exit(0)
+except SystemExit:
+    raise
+except Exception as e:  # pragma: no cover
+    print(f"[wrapper] trade calendar check skipped: {e}")
+
 SCRIPT = f"{SCRIPT_DIR}/daily_report.py"
 sys.path.insert(0, SCRIPT_DIR)
 sys.argv = [SCRIPT]
