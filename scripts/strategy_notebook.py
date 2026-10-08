@@ -292,6 +292,17 @@ def _warm_track_old(today):
 
 def build_warm(date, warm=None):
     """初动池：实时扫描（只读缓存）→ 当日候选即流水；跟踪表=旧行刷新+当日追加（跨日保留）。"""
+    # 2026-10-08 修复：休市日守卫。10-01 曾用 T-1 静态数据登记伪信号日，
+    # 产生「信号日不在K线内，待刷新」僵尸跟踪行（华东医药）。非交易日不登记。
+    from datetime import date as _date
+    try:
+        from trade_calendar import is_trading_day
+        d = _date.fromisoformat(date) if isinstance(date, str) else date
+        if not is_trading_day(d):
+            print(f"[笔记本-初动] {date} 非交易日，跳过初动登记")
+            return [], []
+    except Exception:
+        pass
     if warm is None:
         try:
             from warm_start_entry import pick_warm_start

@@ -277,6 +277,48 @@ def generate_full_report(temp, details, pos_advice, boards, picks, rps_rows=None
         print(f"[初动跟踪] 失败 {e}")
     # 2026-09-23 晚版面调整（用户拍板）：交易规则+口径脚注整体移出推送（操作信息已由表格列覆盖，口径入台账）
 
+    # ===== 趋势/短线推荐跟踪池 =====
+    # 2026-10-08 版面调整：推荐跟踪池从 04(2) 挪回 03 推荐个股段（用户确认 04 只放低位启动观察，
+    #   趋势/短线推荐及其跟踪均属 03 推荐个股范畴；此前 04(2) 以低位池为主体、推荐跟踪池为补充）。
+    if track_rows:
+        ext_n = track_overview.get('展期数', 0)
+        ext_s = f"｜ 🟢展期中 {ext_n} 只（≤2只，最长60天）" if ext_n else ""
+        # 虚拟净值：双策略分开展示（仅渲染非空池，避免空池出现 "****" 占位）
+        trend_nav = track_overview.get("趋势", {}).get("虚拟净值") or {}
+        short_nav = track_overview.get("短线", {}).get("虚拟净值") or {}
+        nav_parts = []
+        if trend_nav:
+            nav_parts.append(f"**趋势净值 {trend_nav.get('净值', 0):.0f}（{trend_nav.get('累计收益率', 0):+.2f}%）**")
+        if short_nav:
+            nav_parts.append(f"**短线净值 {short_nav.get('净值', 0):.0f}（{short_nav.get('累计收益率', 0):+.2f}%）**")
+        nav_s = ("｜ " + "｜ ".join(nav_parts)) if nav_parts else ""
+        lines.append(f"### (4) 📋 推荐跟踪池（趋势/短线持仓跟踪）\n")
+        lines.append(f"> 推荐跟踪池 **{track_overview.get('总只数', 0)} 只**，总盈亏 {track_overview.get('总盈亏', 0):+.1f}%（平均 {track_overview.get('平均盈亏', 0):+.1f}%）{ext_s}{nav_s}｜ {track_overview.get('建议', '')}\n")
+        # 表格含止损/止盈字段（简洁展示）
+        lines.append("| 名称 | 策略 | 推荐日 | 现价 | 累计% | 最高% | 止损 | 止盈1 | 止盈2 | 操作建议 |")
+        lines.append("|------|------|--------|------|-------|-------|------|-------|-------|----------|")
+        for r in track_rows:
+            tag = "展期" if r.get("展期") else (r.get("策略标签") or "趋势")
+            sl = r.get("更新止损") or r.get("止损价") or "-"
+            tp1 = r.get("更新止盈1") or r.get("止盈1") or "-"
+            tp2 = r.get("更新止盈2") or r.get("止盈2") or "-"
+            # 数字格式美化
+            try: tp1 = f"{float(tp1):.2f}"
+            except: pass
+            try: tp2 = f"{float(tp2):.2f}"
+            except: pass
+            try: sl = f"{float(sl):.2f}"
+            except: pass
+            lines.append(f"| {r['名称']} | {tag} | {r['推荐日']} | {r['现价']} | {r['累计盈亏%']:+.1f}% | {r['最高收益%']:+.1f}% | {sl} | {tp1} | {tp2} | {r['建议']} |")
+        # 仓位预警
+        try:
+            sug_max = int(''.join(filter(str.isdigit, pos_advice[0].split('-')[-1])) or 0)
+        except Exception:
+            sug_max = 0
+        if sug_max and track_overview.get('总只数', 0) >= 2 and track_overview.get('平均盈亏', 0) < -3:
+            lines.append(f"\n> ⚠️ 跟踪池平均浮亏 {track_overview['平均盈亏']:+.1f}%，且今日建议仓位 {pos_advice[0]}，优先处理亏损票、暂缓开新仓")
+        lines.append("")
+
     # 低位埋伏候选池（观察池）—— 2026-09-12 新增
     # ⚠️ 本池为研究观察工具，非买入推荐。2026-09-30 起单路径（近期超卖路径已停用），仅供盘后研究参考。
     # 2026-09-21 版面重构：低位候选/连续追踪/风控提醒合并为「04 · 低位启动观察」三子段
@@ -314,8 +356,8 @@ def generate_full_report(temp, details, pos_advice, boards, picks, rps_rows=None
         lines.append("> 明日关注：若量比≥1.5x + 涨幅9-15% + 成交额4-16亿 + 突破MA20 → 可能触发买入信号（届时再做决策）\n")
 
     # ===== 连续追踪 =====
-    # 2026-09-24 修复：低位观察池在册票（watch_history）是主体，趋势/短线推荐跟踪池为补充。
-    #   此前 (2) 段只渲染推荐跟踪池（track_rows），低位池在册票晨报完全看不到（复盘有）。
+    # 2026-09-24 修复：低位观察池在册票（watch_history）为主体。
+    # 2026-10-08 版面调整：趋势/短线推荐跟踪池已挪回 03(4)，本段只保留低位观察池在册票。
     lines.append("### ▎(2) 连续追踪\n")
     # --- 低位观察池在册票（与收盘复盘 _track_watch_pool 同源）---
     low_tracked = []
@@ -359,46 +401,8 @@ def generate_full_report(temp, details, pos_advice, boards, picks, rps_rows=None
         if urgent:
             lines.append(f"> ⚠️ 其中 **{len(urgent)} 只**已连续≥3天或临近止损，见上表 🚨/⚠️ 行，需人工优先决策。")
             lines.append("")
-    # --- 趋势/短线推荐跟踪池（补充）---
-    if track_rows:
-        ext_n = track_overview.get('展期数', 0)
-        ext_s = f"｜ 🟢展期中 {ext_n} 只（≤2只，最长60天）" if ext_n else ""
-        # 虚拟净值：双策略分开展示（仅渲染非空池，避免空池出现 "****" 占位）
-        trend_nav = track_overview.get("趋势", {}).get("虚拟净值") or {}
-        short_nav = track_overview.get("短线", {}).get("虚拟净值") or {}
-        nav_parts = []
-        if trend_nav:
-            nav_parts.append(f"**趋势净值 {trend_nav.get('净值', 0):.0f}（{trend_nav.get('累计收益率', 0):+.2f}%）**")
-        if short_nav:
-            nav_parts.append(f"**短线净值 {short_nav.get('净值', 0):.0f}（{short_nav.get('累计收益率', 0):+.2f}%）**")
-        nav_s = ("｜ " + "｜ ".join(nav_parts)) if nav_parts else ""
-        lines.append(f"> 推荐跟踪池 **{track_overview.get('总只数', 0)} 只**，总盈亏 {track_overview.get('总盈亏', 0):+.1f}%（平均 {track_overview.get('平均盈亏', 0):+.1f}%）{ext_s}{nav_s}｜ {track_overview.get('建议', '')}\n")
-        # 表格含止损/止盈字段（简洁展示）
-        lines.append("| 名称 | 策略 | 推荐日 | 现价 | 累计% | 最高% | 止损 | 止盈1 | 止盈2 | 操作建议 |")
-        lines.append("|------|------|--------|------|-------|-------|------|-------|-------|----------|")
-        for r in track_rows:
-            tag = "展期" if r.get("展期") else (r.get("策略标签") or "趋势")
-            sl = r.get("更新止损") or r.get("止损价") or "-"
-            tp1 = r.get("更新止盈1") or r.get("止盈1") or "-"
-            tp2 = r.get("更新止盈2") or r.get("止盈2") or "-"
-            # 数字格式美化
-            try: tp1 = f"{float(tp1):.2f}"
-            except: pass
-            try: tp2 = f"{float(tp2):.2f}"
-            except: pass
-            try: sl = f"{float(sl):.2f}"
-            except: pass
-            lines.append(f"| {r['名称']} | {tag} | {r['推荐日']} | {r['现价']} | {r['累计盈亏%']:+.1f}% | {r['最高收益%']:+.1f}% | {sl} | {tp1} | {tp2} | {r['建议']} |")
-        # 仓位预警
-        try:
-            sug_max = int(''.join(filter(str.isdigit, pos_advice[0].split('-')[-1])) or 0)
-        except Exception:
-            sug_max = 0
-        if sug_max and track_overview.get('总只数', 0) >= 2 and track_overview.get('平均盈亏', 0) < -3:
-            lines.append(f"\n> ⚠️ 跟踪池平均浮亏 {track_overview['平均盈亏']:+.1f}%，且今日建议仓位 {pos_advice[0]}，优先处理亏损票、暂缓开新仓")
-        lines.append("")
-    elif not low_old:
-        lines.append("> 当前无未结清推荐跟踪池，低位观察池亦无在册存量。今日新推荐将自动入池，收盘后启动连续跟踪。\n")
+    else:
+        lines.append("> 当前低位观察池无在册存量。今日新推荐将自动入池，收盘后启动连续追踪。\n")
 
     lines.append("### (3) 风控速查")
     lines.append("- 趋势票：-6% 止损 · 破MA20 离场 · 破MA10 移动止盈")

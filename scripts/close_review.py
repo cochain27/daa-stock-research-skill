@@ -182,7 +182,22 @@ def _archive_watch(watch, today):
     历史观察池无处可查 —— 这里按日期累加进 data/watch_history.csv，同日重跑去重。
     """
     import csv, shutil
+    from datetime import date as _date
     path = BASE / "data" / "watch_history.csv"
+
+    # 2026-10-08 修复：休市日守卫。10-01 长假曾用 T-1 静态数据重复登记入池，
+    # 污染 watch_history（3行）+ 低位笔记本（5行）。watch_history 唯一写入口，
+    # 在此拦截最彻底（DAA_FORCE_RUN=1 手动补跑可强制）。
+    import os as _os
+    if _os.environ.get("DAA_FORCE_RUN") != "1":
+        try:
+            from trade_calendar import is_trading_day
+            d = _date.fromisoformat(today) if isinstance(today, str) else today
+            if not is_trading_day(d):
+                print(f"[低位观察池] {today} 非交易日，跳过入池落盘（防止 T-1 静态数据污染 watch_history）")
+                return path
+        except Exception:
+            pass
 
     # 当日待写入的记录（去重：同日期+同代码只留一条）
     new_rows = []
@@ -260,9 +275,22 @@ def _track_watch_pool(today, lookback_days=10):
     # 读取近 N 天记录（自然日窗口，含周末/节假日）
     cutoff = (datetime.now() - timedelta(days=lookback_days)).strftime("%Y-%m-%d")
     all_rows = []
+    _ghost_codes = set()   # 2026-10-08 幽灵票修复：窗口外「观察中」存量票（仅失效判定，不展示）
     with path.open(encoding="utf-8") as f:
         for r in csv.DictReader(f):
             if r.get("日期", "") >= cutoff:
+                all_rows.append(r)
+            # 2026-10-08 幽灵票修复：窗口外「观察中」存量票也纳入（仅 T+5 失效判定+落盘，
+            # 不进展示）。此前窗口外票永不判定 → 状态永停「观察中」→ filter_active_pool
+            # 永久剔除 → 永远失去重新入池资格（上峰材料 09-04 入池至今 20+ 交易日未失效）。
+            # 已触发（豁免 T+5）的存量票不在此列，走持仓跟踪分支。
+            elif (r.get("状态", "").strip() == "观察中"
+                  and str(r.get("已触发", "")).strip() != "1"):
+                all_rows.append(r)
+                _ghost_codes.add(r.get("代码"))
+            # 2026-10-08 持仓票窗口豁免：窗口外「已触发」票不受 10 天窗口限制
+            # （持仓跟踪规则最长 T+20，破窗口即丢会让中国电影这类刚触发票次日蒸发）。
+            elif str(r.get("已触发", "")).strip() == "1":
                 all_rows.append(r)
 
     if not all_rows:
@@ -531,6 +559,12 @@ def _track_watch_pool(today, lookback_days=10):
             "industry": latest.get("行业", ""),
             "fired": bool(trigger_hit),  # 2026-09-30：是否已触发（豁免 T+5 依据，落盘持久化）
         })
+
+    # 2026-10-08 幽灵票修复：窗口外「观察中」票只参与 T+5 失效判定（_expired_codes 已收集），
+    # 不进展示结果（避免连续追踪表出现超窗口的僵尸行）。
+    # 例外：窗口外票今日触发启动（fired=True）→ 是重新激活而非幽灵，正常展示+落盘「已触发」。
+    if _ghost_codes:
+        results = [r for r in results if not (r["code"] in _ghost_codes and not r.get("fired"))]
 
     # 按出现天数降序 → 距止损升序（越危险越靠前）
     results.sort(key=lambda r: (-r["days_count"],
