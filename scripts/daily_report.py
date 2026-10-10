@@ -1,8 +1,13 @@
 # -*- coding: utf-8 -*-
 """日报生成：完整日报 + 精简版推送文本"""
+import os as _os
 import sys
 from datetime import datetime
 import pandas as pd
+
+# 2026-10-10 补跑支持：外部注入报告日期（DAA_REPORT_DATE=YYYY-MM-DD），
+# 否则凌晨/补跑时 now() 会把「次日名 + 前日数据」错配（10-09 复盘误用 10-08 数据的根因）。
+TODAY = _os.environ.get("DAA_REPORT_DATE") or datetime.now().strftime("%Y-%m-%d")
 from market_analysis import calc_market_temperature, safe_market_temperature, decide_position, single_stock_position, judge_market_env
 from stock_screener import (top_industry_boards, pick_top_stocks, value_screen, pick_quality,
                             pick_shortline_stocks, pick_trend_stocks, bottom_fishing_picks,
@@ -45,7 +50,7 @@ def generate_full_report(temp, details, pos_advice, boards, picks, rps_rows=None
                          market_env=None, env_desc=None, env_reason=None,
                          low_pos_picks=None, warm_picks=None):
     """生成完整日报 markdown"""
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = TODAY
     lines = []
     # 三池分组（速览与推荐个股共用；短线激进/右侧趋势为正式策略1、2，初动池为第3策略，低位埋伏为观察池）
     short_list = [p for p in picks if _is_short(p)]
@@ -363,7 +368,7 @@ def generate_full_report(temp, details, pos_advice, boards, picks, rps_rows=None
     low_tracked = []
     if LOW_POS_TRACK_ENABLED:
         try:
-            low_tracked = _track_watch_pool(datetime.now(), lookback_days=10)
+            low_tracked = _track_watch_pool(TODAY, lookback_days=10)
         except Exception as e:
             print(f"[低位追踪] 失败 {e}")
     low_old = [t for t in low_tracked if t["first_date"] != today]  # 当日新入池已在 (1) 候选表，不重复
@@ -412,14 +417,14 @@ def generate_full_report(temp, details, pos_advice, boards, picks, rps_rows=None
     lines.append("---")
     lines.append("*免责声明：本报告为个人研究记录，不构成任何投资建议；市场有风险，据此操作风险自负。*")
     lines.append("*数据说明：K线为腾讯前复权口径，盘前/节假日部分维度数据缺失时以已得数据为准；推荐即虚拟成交（按推荐时实时价入账）。*")
-    lines.append(f"*生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M')} ｜ 大A每日投研系统（三正式策略+一观察池）｜ Rachael*")
+    lines.append(f"*生成时间：{TODAY} {datetime.now().strftime('%H:%M')} ｜ 大A每日投研系统（三正式策略+一观察池）｜ Rachael*")
     return "\n".join(lines)
 
 
 def generate_brief(temp, pos_advice, boards, picks, track_rows=None, track_overview=None, market_env=None,
                    low_pos_picks=None, warm_picks=None):
     """精简版推送文本"""
-    today = datetime.now().strftime("%m-%d")
+    today = TODAY[5:]
     regime = pos_advice[1].split('：')[0] if '：' in pos_advice[1] else pos_advice[1]
     env_s = f"[{market_env}] " if market_env else ""
     lines = [f"【大A投研 {today}】"]
@@ -664,7 +669,7 @@ def run_daily():
     except Exception as _e:
         print(f"[排雷] 跳过（{_e}）")
 
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = TODAY
     path = PUSH_DIR / f"推送_{today}.md"
     path.write_text(full, encoding="utf-8")
     print(brief)

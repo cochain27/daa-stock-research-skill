@@ -5,6 +5,10 @@
 """
 import csv, re
 from datetime import datetime
+import os as _os
+
+# 2026-10-10 补跑支持：DAA_REPORT_DATE 指定报告日期（台账/体检日期随动）
+TODAY = _os.environ.get("DAA_REPORT_DATE") or datetime.now().strftime("%Y-%m-%d")
 from pathlib import Path
 import pandas as pd
 from fetch_data import get_realtime_quotes, get_stock_hist
@@ -30,7 +34,7 @@ def check_virtual_settled(log_path):
     if not VIRTUAL_ENABLED:
         return 0, "虚拟盘未启用"
 
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = TODAY
     if not Path(log_path).exists():
         return 0, f"台账不存在: {log_path}"
 

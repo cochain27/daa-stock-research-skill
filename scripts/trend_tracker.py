@@ -8,6 +8,10 @@
 """
 import csv
 from datetime import datetime
+import os as _os
+
+# 2026-10-10 补跑支持：DAA_REPORT_DATE 指定报告日期（台账/体检日期随动）
+TODAY = _os.environ.get("DAA_REPORT_DATE") or datetime.now().strftime("%Y-%m-%d")
 from pathlib import Path
 import pandas as pd
 from fetch_data import get_realtime_quotes
@@ -57,7 +61,7 @@ def check_and_init():
 def log_picks(picks, market_env=None):
     """趋势票推荐落账（同日同票不重复）；推荐即虚拟成交"""
     check_and_init()
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = TODAY
     rows = _read_rows(TRACK_TREND_PATH)
     existing = {(r["日期"], r["代码"]) for r in rows}
     # 2026-09-30 修复：已在池（持有中/展期中）的票不重复登记，避免推荐日被错标为重复登记日
@@ -97,7 +101,7 @@ def log_picks(picks, market_env=None):
 def update_track():
     """收盘更新趋势跟踪票状态：止盈/止损/到期/展期/技术面"""
     check_and_init()
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = TODAY
     rows = _read_rows(TRACK_TREND_PATH)
     open_rows = [r for r in rows if r["状态"] in OPEN_STATUS]
     if not open_rows:
@@ -175,7 +179,7 @@ def load_open_picks():
 def analyze_track_pool():
     """趋势跟踪池分析"""
     check_and_init()
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = TODAY
     rows = load_open_picks()
     if not rows:
         return [], {"总只数": 0, "总盈亏": 0, "平均盈亏": 0, "破止损": 0,

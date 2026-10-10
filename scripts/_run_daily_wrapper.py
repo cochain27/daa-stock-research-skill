@@ -208,7 +208,10 @@ try:
     sys.path.insert(0, SCRIPT_DIR)
     from trade_calendar import is_trading_day, next_trading_day
     from datetime import date as _date
-    _today = _date.today()
+    import os as _os
+    # 2026-10-10：补跑时以 DAA_REPORT_DATE 为准判断交易日（周六补跑 10-09 复盘不应被今天拦截）
+    _rep = _os.environ.get("DAA_REPORT_DATE") or ""
+    _today = _date.fromisoformat(_rep) if _rep else _date.today()
     if not is_trading_day(_today):
         print(f"[wrapper] {_today} 非交易日（法定休市），跳过日报生成与推送。"
               f"下一个交易日 {next_trading_day(_today)}")

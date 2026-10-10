@@ -9,6 +9,10 @@
 """
 import csv
 from datetime import datetime, timedelta
+import os as _os
+
+# 2026-10-10 补跑支持：DAA_REPORT_DATE 指定报告日期（台账/体检日期随动）
+TODAY = _os.environ.get("DAA_REPORT_DATE") or datetime.now().strftime("%Y-%m-%d")
 from pathlib import Path
 import pandas as pd
 from fetch_data import get_realtime_quotes, get_stock_hist
@@ -89,7 +93,7 @@ def _next_trading_day(date_str, offset):
 def log_picks(picks, market_env=None):
     """短线票推荐落账；推荐即虚拟成交；同步写入回测台账（待结算状态）"""
     check_and_init()
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = TODAY
     rows = _read_rows(TRACK_SHORT_PATH)
     existing = {(r["日期"], r["代码"]) for r in rows}
     # 2026-09-30 修复：同一票在池期间（持有中/止盈1减半）不再重复登记新行。
@@ -168,7 +172,7 @@ def log_picks(picks, market_env=None):
 def roll_backtest():
     """收盘/次日早盘：结算所有"待结算"回测记录，获取T+2开盘价，计算3天回测盈亏"""
     check_and_init()
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = TODAY
     rows = _read_backtest()
     updated = 0
     for r in rows:
@@ -207,7 +211,7 @@ def roll_backtest():
 def update_track():
     """收盘更新短线跟踪票状态（含每日情绪分重评淘汰）"""
     check_and_init()
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = TODAY
     rows = _read_rows(TRACK_SHORT_PATH)
     open_rows = [r for r in rows if r["状态"] in OPEN_STATUS]
     if not open_rows:
@@ -289,7 +293,7 @@ def load_open_picks():
 def analyze_track_pool():
     """短线跟踪池分析（含每日情绪分重评，低于及格线剔除）"""
     check_and_init()
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = TODAY
     rows = load_open_picks()
     if not rows:
         return [], {"总只数": 0, "总盈亏": 0, "平均盈亏": 0, "破止损": 0,

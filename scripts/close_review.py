@@ -636,7 +636,9 @@ def _nav_line(nav):
 
 
 def run_close():
-    today = datetime.now().strftime("%Y-%m-%d")
+    # 2026-10-10 补跑支持：DAA_REPORT_DATE=YYYY-MM-DD 可指定报告日期（凌晨/补跑用），
+    # 否则 now() 会产生「次日名 + 前日数据」错配（10-09 复盘误用 10-08 数据的根因）。
+    today = os.environ.get("DAA_REPORT_DATE") or datetime.now().strftime("%Y-%m-%d")
     now = datetime.now().strftime("%H:%M")
     # ===== 2026-09-16 三报合一：收盘复盘前先以 --no-push 模式触发选股登记 =====
     # 晨报/午间复盘取消推送后，选股逻辑（趋势/短线/低位观察池）统一下沉到收盘复盘：
@@ -1189,9 +1191,11 @@ if __name__ == "__main__":
         try:
             from trade_calendar import is_trading_day, next_trading_day
             from datetime import date as _date
-            if not is_trading_day(_date.today()):
-                print(f"[收盘复盘] {_date.today()} 非交易日（法定休市），跳过选股登记与推送。"
-                      f"下一个交易日 {next_trading_day(_date.today())}")
+            # 补跑指定了报告日期时，以报告日期为准判断交易日（而非今天），否则周六补跑会被误拦
+            _judge = _date.fromisoformat(_os.environ.get("DAA_REPORT_DATE")) if _os.environ.get("DAA_REPORT_DATE") else _date.today()
+            if not is_trading_day(_judge):
+                print(f"[收盘复盘] {_judge} 非交易日（法定休市），跳过选股登记与推送。"
+                      f"下一个交易日 {next_trading_day(_judge)}")
                 raise SystemExit(0)
         except SystemExit:
             raise
