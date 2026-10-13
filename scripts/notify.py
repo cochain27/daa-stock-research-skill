@@ -365,7 +365,9 @@ def push_wechat(title, content, channel=None, html=False):
 
     if ch == "pushplus" and cfg.get("pushplus_token"):
         try:
-            r = requests.post("https://www.pushplus.plus/send", json={
+            _s = requests.Session()
+            _s.trust_env = False  # 国内接口直连，绕过系统代理(trojan 全局)
+            r = _s.post("https://www.pushplus.plus/send", json={
                 "token": cfg["pushplus_token"],
                 "title": title[:100],
                 "content": content,
@@ -379,7 +381,9 @@ def push_wechat(title, content, channel=None, html=False):
     if ch == "serverchan" and cfg.get("serverchan_key"):
         try:
             key = cfg["serverchan_key"]
-            r = requests.post(f"https://sctapi.ftqq.com/{key}.send", data={
+            _s = requests.Session()
+            _s.trust_env = False  # 国内接口直连，绕过系统代理
+            r = _s.post(f"https://sctapi.ftqq.com/{key}.send", data={
                 "title": title[:32],
                 "desp": content,
             }, timeout=10)

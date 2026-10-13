@@ -223,5 +223,7 @@ except Exception as e:  # pragma: no cover
 
 SCRIPT = f"{SCRIPT_DIR}/daily_report.py"
 sys.path.insert(0, SCRIPT_DIR)
-sys.argv = [SCRIPT]
+# 2026-10-12 修复：保留透传参数（--no-push），此前无条件重置 argv 会把
+# close_review 传入的 --no-push 丢弃 → 收盘复盘流程在 15:18 又推了一封"晨报"。
+sys.argv = [SCRIPT] + sys.argv[1:]
 runpy.run_path(SCRIPT, run_name="__main__")
