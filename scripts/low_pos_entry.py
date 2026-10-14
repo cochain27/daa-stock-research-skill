@@ -146,8 +146,8 @@ def _load_hist(code, days=180):
     except Exception:
         pass
     if rows is None:
+        # 备选：新浪（不复权）
         try:
-            # 备选：新浪（不复权）
             r = s.get(SINA_KLINE, params={"symbol": sym, "scale": "240",
                                           "ma": "no", "datalen": str(days)}, timeout=15)
             if r.status_code == 200:
@@ -157,6 +157,47 @@ def _load_hist(code, days=180):
                              float(x["high"]), float(x["low"]), float(x["volume"])] for x in arr]
         except Exception:
             pass
+    # 2026-10-14 修复：数据新鲜度守卫。腾讯 fqkline 被 WAF 风控(HTTP 501)时回退新浪，
+    #   但新浪 K 线可能尚未刷新当日(返回截至 T-1 的旧数据)，导致复盘用昨日候选污染
+    #   watch_history（10-14 事故：二次扫描拿到 10-13 候选明阳/华友/北汽）。因此：
+    #   1) 数据末行 < 最近交易日 → 用腾讯 qt 实时行情补当日K线（qt.gtimg.cn 实测不受 WAF 风控）；
+    #   2) 补行失败且末行仍落后 → 弃用该票（宁缺毋滥，不静默用旧数据入池）。
+    if rows is not None:
+        _last_row = None
+        try:
+            _last_row = str(pd.to_datetime(rows[-1][0]).date())
+        except Exception:
+            _last_row = None
+        _expect = None
+        try:
+            from trade_calendar import next_trading_day
+            from datetime import date as _date
+            _expect = str(next_trading_day(_date.today()))
+        except Exception:
+            _expect = str(datetime.now().strftime("%Y-%m-%d"))
+        if _last_row is not None and _last_row < _expect:
+            # 末行落后于最近交易日 → 尝试用腾讯 qt 实时行情补当日K线
+            _patched = False
+            try:
+                q = s.get("https://qt.gtimg.cn/q=" + sym, timeout=8)
+                if q.status_code == 200 and "~" in q.text:
+                    f = q.text.split("~")
+                    # 字段：0代码 1名称 3现价 4昨收 5今开 30时间 33最高 34最低 36成交量(手) 37成交额(万)
+                    if len(f) > 37 and float(f[3]) > 0:
+                        _d = f[30][:8]
+                        _open = float(f[5]); _cur = float(f[3])
+                        _hi = float(f[33]) if len(f) > 33 and f[33] else _cur
+                        _lo = float(f[34]) if len(f) > 34 and f[34] else _cur
+                        _vol = float(f[36]) * 100 if len(f) > 36 and f[36] else 0  # 手→股
+                        # 仅当补入行日期 > 现有末行日期时追加（幂等，防重复/覆盖）
+                        if _d > _last_row:
+                            rows.append([_d, _open, _cur, _hi, _lo, _vol])
+                            _patched = True
+            except Exception:
+                _patched = False
+            if not _patched:
+                # 补行失败且末行仍落后 → 弃用（宁缺毋滥，不静默用旧数据入池）
+                rows = None
     if not rows:
         return code, None
     # rows 元组顺序统一为 [日期, 开盘, 收盘, 最高, 最低, 成交量]，再重排为标准列序
