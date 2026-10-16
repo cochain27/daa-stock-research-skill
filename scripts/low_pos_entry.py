@@ -190,8 +190,12 @@ def _load_hist(code, days=180):
                         _lo = float(f[34]) if len(f) > 34 and f[34] else _cur
                         _vol = float(f[36]) * 100 if len(f) > 36 and f[36] else 0  # 手→股
                         # 仅当补入行日期 > 现有末行日期时追加（幂等，防重复/覆盖）
-                        if _d > _last_row:
-                            rows.append([_d, _open, _cur, _hi, _lo, _vol])
+                        # 2026-10-16 修复：qt 实时行情日期为 %Y%m%d（无横线），腾讯主源为
+                        #   %Y-%m-%d（带横线），直接混入 rows 会让 pd.to_datetime 遇混合
+                        #   格式抛异常，导致整段低位观察失败（10-16 事故）。统一转为带横线。
+                        _d_fmt = f"{_d[:4]}-{_d[4:6]}-{_d[6:8]}"
+                        if _d_fmt > _last_row:
+                            rows.append([_d_fmt, _open, _cur, _hi, _lo, _vol])
                             _patched = True
             except Exception:
                 _patched = False
@@ -203,7 +207,7 @@ def _load_hist(code, days=180):
     # rows 元组顺序统一为 [日期, 开盘, 收盘, 最高, 最低, 成交量]，再重排为标准列序
     df = pd.DataFrame(rows, columns=["日期", "开盘", "收盘", "最高", "最低", "成交量"])
     df = df[["日期", "开盘", "最高", "最低", "收盘", "成交量"]]
-    df["日期"] = pd.to_datetime(df["日期"])
+    df["日期"] = pd.to_datetime(df["日期"], format="mixed")  # 2026-10-16 兜底：兼容 %Y-%m-%d / %Y%m%d 混排
     df = df.sort_values("日期").reset_index(drop=True)
     df["成交额"] = df["成交量"] * df["收盘"]          # 股数×收盘价（元）
     df["涨跌幅"] = df["收盘"].pct_change() * 100
