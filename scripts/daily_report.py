@@ -45,6 +45,13 @@ try:
 except Exception:
     LOW_POS_TRACK_ENABLED = False
 
+# 低位触发台账（2026-10-20 第 3 台账）：已触发票「推荐即虚拟成交」，计入虚拟净值；T+30 自动离场
+try:
+    from low_pos_tracker import stats as lowpos_stats
+    LOWPOS_STATS_ENABLED = True
+except Exception:
+    LOWPOS_STATS_ENABLED = False
+
 
 def generate_full_report(temp, details, pos_advice, boards, picks, rps_rows=None, track_rows=None, track_overview=None,
                          market_env=None, env_desc=None, env_reason=None,
@@ -437,10 +444,24 @@ def generate_full_report(temp, details, pos_advice, boards, picks, rps_rows=None
     else:
         lines.append("> 当前低位观察池无在册存量。今日新推荐将自动入池，收盘后启动连续追踪。\n")
 
+    # ===== 低位触发台账（2026-10-20 第 3 台账）：已触发票计入推荐台账累计表现+虚拟净值 =====
+    try:
+        if LOWPOS_STATS_ENABLED:
+            lst = lowpos_stats()
+            if lst.get("累计推荐"):
+                nav = lst.get("虚拟净值") or {}
+                nav_s = f" · 虚拟净值 {nav.get('净值', 0):.0f}（累计 {nav.get('累计收益率', 0):+.2f}%）" if nav else ""
+                lines.append(f"### ▎低位触发台账\n")
+                lines.append(f"> 📊 累计触发 {lst['累计推荐']} 只 · 持有中 {lst['持有中']} · 已结清 {lst['已结清']} · 胜率 {lst['胜率']}{nav_s}\n")
+                lines.append("> ⚙️ 已触发启动票自动入账跟踪：+15% 减半 · +25% 清仓 · 破MA5 离场 · -8% 止损 · 最长 T+30 自动离场\n")
+    except Exception as _e:
+        print(f"[低位触发台账] 展示失败 {_e}")
+
     lines.append("### ▎风控速查")
     lines.append("- 趋势票：-6% 止损 · 破MA20 离场 · 破MA10 移动止盈")
     lines.append("- 短线票：-5.5% 止损 · +5% 减半 · 破MA10 清仓 · 最长5天")
     lines.append("- 初动票：-8% 硬止损 · 破MA5 次日离场 · 最长T+5")
+    lines.append("- 低位触发：-8% 止损 · +15% 减半 · +25% 清仓 · 破MA5 离场 · 最长T+30 自动离场")
     lines.append("")
     lines.append("---")
     lines.append("*免责声明：本报告为个人研究记录，不构成任何投资建议；市场有风险，据此操作风险自负。*")

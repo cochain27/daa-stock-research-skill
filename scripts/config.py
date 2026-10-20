@@ -225,7 +225,7 @@ LOW_POS_ENTRY_FIRED_EXEMPT_TIMEOUT = True  # 触发后豁免 T+5 时间止损（
 LOW_POS_ENTRY_FIRED_TP_HALF = 0.15         # 触发后止盈①：浮盈 ≥+15% 减半仓（落袋半仓，余仓续持）
 LOW_POS_ENTRY_FIRED_TP_FULL = 0.25         # 触发后止盈②：浮盈 ≥+25% 清仓（或按破位规则续持，见下）
 LOW_POS_ENTRY_FIRED_TRAIL_MA = 5           # 触发后移动止盈：收盘破 MA5 → 次日开盘离场
-LOW_POS_ENTRY_FIRED_MAX_HOLD = 20          # 触发后最长持有 T+20 交易日（含触发日），到期强制评估离场
+LOW_POS_ENTRY_FIRED_MAX_HOLD = 30          # 触发后最长持有 T+30 交易日（含触发日，2026-10-20 20→30），到期自动离场
 LOW_POS_ENTRY_FIRED_STOP = -0.08           # 触发后止损 -8%（相对触发价，与标准蓄势止损一致）
 # ⑫ 近期超卖路径：2026-09-12 数据补充 → 保留但收紧：
 #   - 极低位(<10%)胜率67%但样本少(9只)；<20%均值1.4%
@@ -336,4 +336,10 @@ SHORT_BACKTEST_AMOUNT = 10_000            # 短线回测每笔虚拟金额
 # ============ 双策略台账路径（2026-09-05 双策略分立） ============
 TRACK_SHORT_PATH = DATA_DIR / "推荐台账_短线激进.csv"   # 短线激进台账
 TRACK_TREND_PATH = DATA_DIR / "推荐台账_右侧趋势.csv"   # 右侧趋势台账
+
+# ============ 低位触发台账（2026-10-20 用户拍板新增第 3 台账） ============
+# 低位观察池票触发启动后「推荐即虚拟成交」入账 → 计入虚拟净值与累计表现。
+# 字段复用趋势台账结构，策略标签=LOWPOS_TAG，结算规则见 low_pos_tracker.py。
+TRACK_LOWPOS_PATH = DATA_DIR / "推荐台账_低位触发.csv"   # 低位触发台账
+LOWPOS_TAG = "低位触发"
 

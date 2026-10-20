@@ -13,6 +13,7 @@ from market_analysis import calc_market_temperature, safe_market_temperature, de
 from fetch_data import get_market_snapshot, get_industry_boards, get_realtime_quotes, get_index_daily
 from trend_tracker import analyze_track_pool as trend_analyze, update_track as trend_update, stats as trend_stats
 from short_tracker import analyze_track_pool as short_analyze, update_track as short_update, stats as short_stats, roll_backtest
+from low_pos_tracker import register_fired as lowpos_register, update_track as lowpos_update, stats as lowpos_stats, analyze_track_pool as lowpos_analyze
 import config
 from config import REVIEW_DIR, PUSH_DIR, VIRTUAL_ENABLED
 
@@ -465,7 +466,8 @@ def _track_watch_pool(today, lookback_days=10):
             if trigger_hit:
                 # ---- 2026-09-30 用户拍板：触发后转「持仓跟踪」----
                 #   ① 豁免 T+5 时间止损（不再按入池期限移出，直到止盈/止损离场为止）
-                #   ② 给出具体止盈操作建议（+15% 减半 / +25% 清仓 / 破MA5 次日离场 / T+20 到期评估 / -8% 止损）
+                #   ② 给出具体止盈操作建议（+15% 减半 / +25% 清仓 / 破MA5 次日离场 / T+30 自动离场 / -8% 止损）
+                #   ③ 2026-10-20 用户拍板：触发即入第 3 台账（低位触发），计入虚拟净值与累计表现
                 _fired_codes.append(code)   # 落盘「已触发」持久化标记，跨日豁免生效
                 # 浮盈基准：优先触发价（首次触发日收盘/介入价），回退首现日收盘
                 _base = first_price
@@ -481,7 +483,7 @@ def _track_watch_pool(today, lookback_days=10):
                 elif _gain is not None and _gain >= _fired_tp_half * 100:
                     tp_acts.append(f"🎯已+{_gain:.0f}%：减半仓，余仓看破MA5")
                 else:
-                    tp_acts.append(f"持有跟踪（+15%减半/+25%清仓/破MA5次日离场/最长T+{_fired_max_hold}）")
+                    tp_acts.append(f"持有跟踪（+15%减半/+25%清仓/破MA5次日离场/最长T+{_fired_max_hold}自动离场）")
                 # 破 MA5 检查（移动止盈）
                 _below_ma5 = False
                 try:
@@ -489,12 +491,22 @@ def _track_watch_pool(today, lookback_days=10):
                 except Exception:
                     _h = None
                 if days_count > _fired_max_hold:
-                    tp_acts.append(f"⏰已达T+{days_count}（上限T+{_fired_max_hold}），次日开盘评估离场")
+                    tp_acts.append(f"⏰已达T+{days_count}（上限T+{_fired_max_hold}），次日自动离场")
                 status = (f"🚀已启动T+{days_count}"
                           + (f"（浮盈{_gain:+.1f}%）" if _gain is not None else "")
                           + "：" + "；".join(tp_acts))
                 status_tag = "🚀已触发跟踪"
                 action = "；".join(tp_acts)
+                # 2026-10-20：触发票入第 3 台账（低位触发）——「推荐即虚拟成交」
+                try:
+                    lowpos_register([{
+                        "code": code, "name": name,
+                        "cur_price": cur_price, "触发价": _base,
+                        "buy_zone": buy_zone, "止损价": stop_loss,
+                        "first_date": first_date,
+                    }], today=today_s)
+                except Exception as _e:
+                    print(f"[低位触发台账] 入账失败 {code}: {_e}")
             else:
                 # 止损接近判断：现价距止损 ≤2%（优先于时间止损——破位止损比超时更紧急）
                 _hit_stop = False
@@ -757,13 +769,19 @@ def run_close():
                               "策略标签": tag})
             lines.append("")
 
-    # ===== 双策略跟踪池收盘体检（先更新状态再分析） =====
+    # ===== 三策略跟踪池收盘体检（先更新状态再分析） =====
     try:
         tn, tmsg = trend_update()
         sn, smsg = short_update()
         print(f"[台账] 趋势{tn}条更新：{tmsg}；短线{sn}条更新：{smsg}")
     except Exception as e:
         print(f"[台账] 更新失败 {e}")
+    # 2026-10-20 第 3 台账：低位触发持仓收盘体检（止盈/破MA5/止损/T+30 自动离场）
+    try:
+        ln, lmsg = lowpos_update()
+        print(f"[台账] 低位触发{ln}条更新：{lmsg}")
+    except Exception as e:
+        print(f"[台账] 低位触发更新失败 {e}")
     # 短线3日回测滚动结算
     try:
         bk_n, bk_msg = roll_backtest()
@@ -773,16 +791,20 @@ def run_close():
 
     trend_rows, trend_overview = trend_analyze()
     short_rows, short_overview = short_analyze()
+    lowpos_rows, lowpos_overview = lowpos_analyze()
     track_rows = trend_rows + short_rows
 
-    # 双净值展示（仅渲染非空池，避免空池出现 "****" 占位）
+    # 三净值展示（仅渲染非空池，避免空池出现 "****" 占位）
     trend_nav = trend_overview.get("虚拟净值") or {}
     short_nav = short_overview.get("虚拟净值") or {}
+    lowpos_nav = lowpos_overview.get("虚拟净值") or {}
     nav_parts = []
     if trend_nav:
         nav_parts.append(f"**趋势净值 {trend_nav.get('净值', 0):.0f}（{trend_nav.get('累计收益率', 0):+.2f}%）**")
     if short_nav:
         nav_parts.append(f"**短线净值 {short_nav.get('净值', 0):.0f}（{short_nav.get('累计收益率', 0):+.2f}%）**")
+    if lowpos_nav:
+        nav_parts.append(f"**低位触发净值 {lowpos_nav.get('净值', 0):.0f}（{lowpos_nav.get('累计收益率', 0):+.2f}%）**")
     nav_s = ("｜ " + "｜ ".join(nav_parts)) if nav_parts else ""
 
     def _tag_advice(prefix, msg):
@@ -1074,14 +1096,16 @@ def run_close():
         lines.append(f"\n## 低位启动观察\n\n- 筛选异常：{e}\n")
         print(f"[低位观察] 失败 {e}")
 
-    # ===== 双策略台账累计表现 + 双虚拟净值（置于推送末尾）=====
+    # ===== 三策略台账累计表现 + 三虚拟净值（置于推送末尾）=====
     # （2026-09-23 明日关注块已移入上方低位启动观察段，位于连续追踪之前）
     # 2026-09-30 用户拍板：撤掉「回测」列（短线3日回测结果不进推送，避免与研究口径
     #   混淆，也贴合「推送只留可执行信息」原则）；回测数据仍保留在 data/短线回测台账.csv，
     #   需要时由 short_tracker.stats() / roll_backtest() 查询。
+    # 2026-10-20 用户拍板：新增第 3 台账「低位触发」（触发即虚拟成交，计入净值）。
     try:
         tst = trend_stats()
         sst = short_stats()
+        lst = lowpos_stats()
 
         def _nav_cell(st, nav):
             if nav:
@@ -1101,8 +1125,9 @@ def run_close():
         lines.append("|------|---------|------|---------|------|-----------|--------|------|------------|")
         lines.append("| " + " | ".join(str(x) for x in _nav_cell(tst, tst.get("虚拟净值"))) + " |")
         lines.append("| " + " | ".join(str(x) for x in _nav_cell(sst, sst.get("虚拟净值"))) + " |")
+        lines.append("| " + " | ".join(str(x) for x in _nav_cell(lst, lst.get("虚拟净值"))) + " |")
         lines.append("")
-        lines.append("> 台账文件：`data/推荐台账_右侧趋势.csv` + `data/推荐台账_短线激进.csv`\n")
+        lines.append("> 台账文件：`data/推荐台账_右侧趋势.csv` + `data/推荐台账_短线激进.csv` + `data/推荐台账_低位触发.csv`\n")
     except Exception as e:
         lines.append(f"- 台账统计异常：{e}\n")
         print(f"[台账] 统计失败 {e}")
