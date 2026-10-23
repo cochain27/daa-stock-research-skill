@@ -100,7 +100,7 @@ def _load_kline(code):
     return None
 
 
-def warm_replay(sig_date, code, max_hold=5, stop=-8.0):
+def warm_replay(sig_date, code, max_hold=5, stop=-8.0, name=""):
     """V2 出场规则本地重放，返回 dict（信号级）。
 
     口径（与台账 V2 固化一致）：T+1 开盘介入；-8% 硬止损（当日最低≤止损价→按止损价出）；
@@ -144,7 +144,7 @@ def warm_replay(sig_date, code, max_hold=5, stop=-8.0):
         else:
             return None  # 未到期/数据不足，不计结算
     ret = (exit_px / entry - 1) * 100
-    return {"信号日": sig_date, "代码": code, "名称": "", "介入": entry,
+    return {"信号日": sig_date, "代码": code, "名称": name, "介入": entry,
             "收益%": ret, "结果": exit_reason}
 
 
@@ -228,7 +228,7 @@ def main():
     wn, wwr, wavg, wpl, wdetail = 0, None, None, None, []
     name_of = {s["代码"]: s["名称"] for s in sigs}
     for s in sigs_win:
-        r = warm_replay(s["信号日"], s["代码"])
+        r = warm_replay(s["信号日"], s["代码"], name=s.get("名称", ""))
         if r:
             r["名称"] = name_of.get(s["代码"], "")
             wdetail.append(r)
@@ -290,10 +290,10 @@ def main():
 
     L.append("\n## 三、初动池信号明细（本周）\n")
     if sigs_win:
-        L.append("| 信号日 | 代码 | 名称 | 信号日收盘 | T+5收益% | 结果 |")
+        L.append("| 信号日 | 代码 | 名称 | 介入价(T+1开盘) | T+5收益% | 结果 |")
         L.append("|---|---|---|---|---|---|")
         for s in sigs_win:
-            r = warm_replay(s["信号日"], s["代码"])
+            r = warm_replay(s["信号日"], s["代码"], name=s.get("名称", ""))
             if r:
                 L.append(f"| {r['信号日']} | {r['代码']} | {r['名称']} | {r['介入']:.2f} | {r['收益%']:+.2f} | {r['结果']} |")
             else:

@@ -193,6 +193,15 @@ def warm_tracking_rows(today):
         if len(cells) < 8 or cells[0] == today:
             continue
         meta.append((cells[0], cells[1], cells[2], cells[6]))
+    # 2026-10-23 修复（拉卡拉重复登记）：同一代码只保留**最新信号日**一行。
+    # 原缺陷：10-22 凌晨补跑时 K 线缓存末行仍停在 10-21，同一形态被判为 10-22 新信号，
+    # 笔记本里就出现 10-21/10-22 两行拉卡拉（数值完全相同）。同策略同票不可能持仓两份。
+    _latest = {}
+    for m in meta:
+        cur = _latest.get(m[1])
+        if cur is None or m[0] > cur[0]:
+            _latest[m[1]] = m
+    meta = sorted(_latest.values(), key=lambda m: m[0], reverse=True)
     if prefetch_industries and meta:
         try:
             prefetch_industries([m[1] for m in meta])
@@ -310,6 +319,14 @@ def build_warm(date, warm=None):
         except Exception as e:
             print(f"[笔记本-初动] 扫描失败 {e}")
             warm = []
+    # 2026-10-23 修复（拉卡拉重复登记根因）：剔除**已在有效跟踪窗口内**的票。
+    # 初动是「信号日→T+5」的单次持仓，同一只票在 T+5 内重复出信号属同一波形态，
+    # 重复登记会让流水多出一条、跟踪表并列两行，且台账口径被污染。
+    _active_codes = {r["代码"] for r in warm_tracking_rows(date)}
+    _dup = [w["代码"] for w in warm if w["代码"] in _active_codes]
+    if _dup:
+        print(f"[笔记本-初动] 已在跟踪窗口内，跳过重复登记：{_dup}")
+        warm = [w for w in warm if w["代码"] not in _active_codes]
     flow = []
     for w in warm:
         flow.append(

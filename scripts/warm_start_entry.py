@@ -49,6 +49,8 @@ DATA_DIR = BASE / "data"
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/120.0 Safari/537.36")
 TENCENT_KLINE = "https://proxy.finance.qq.com/ifzqgtimg/appstock/app/fqkline/get"  # 2026-09-19：ifzq/web被WAF拦，此域名稳定
+# 2026-10-23：两者可用性会互换（当时代理域名全 501、web 正常），_fetch_tencent 双域名轮转
+TENCENT_KLINE_ALT = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
 WORKERS = 1  # 2026-09-19：腾讯WAF/proxy限流严格，并发必被拦，改纯顺序
 
 # ===== 最优档参数（回测结论固化）=====
@@ -94,21 +96,27 @@ def _fetch_tencent(symbol, days=80):
 
     腾讯 fqkline 的 volume 列单位是【手】，×100 转成【股】。
     实测 sh600363：原始 141605 手 → 14160500 股(1416万股)，amount=成交量×收盘≈2.15亿 吻合。
-    注意：东财源的旧缓存行 volume 也是【手】，与腾讯行同单位，勿混。"""
+    注意：东财源的旧缓存行 volume 也是【手】，与腾讯行同单位，勿混。
+
+    2026-10-23：两个域名可用性会互换（09-19 记录 proxy 稳定/web 被拦，10-23 实测
+    反过来：proxy 全 501、web 全 200）。改为双域名轮转，任一可用即返回，
+    避免单域名风控导致整批 K 线补数全失败。"""
     # 2026-09-19：腾讯WAF对高频请求拦501，单线程+重试+间隔仍可稳定通过
     s = _new_session()
     # 参数格式: symbol,day,start,end,count,qfq —— start/end 留空会 501，必须给足 count
+    hosts = [TENCENT_KLINE, TENCENT_KLINE_ALT]
     last_err = None
-    for _ in range(3):
+    for i in range(4):
+        host = hosts[i % len(hosts)]
         try:
-            r = s.get(TENCENT_KLINE, params={"param": f"{symbol},day,2024-01-01,2030-01-01,{days},qfq"}, timeout=15)
+            r = s.get(host, params={"param": f"{symbol},day,2024-01-01,2030-01-01,{days},qfq"}, timeout=15)
             r.raise_for_status()
             j = r.json()
             d = (j.get("data") or {}).get(symbol) or {}
             k = d.get("qfqday") or d.get("day") or []
             if not k:
                 last_err = RuntimeError("empty")
-                time.sleep(1.0)
+                time.sleep(0.8)
                 continue
             # 腾讯字段序: date, open, close, high, low, volume(手)
             rows = [[x[0], float(x[1]), float(x[2]), float(x[3]),
@@ -120,7 +128,7 @@ def _fetch_tencent(symbol, days=80):
             return df
         except Exception as e:
             last_err = e
-            time.sleep(1.2)
+            time.sleep(0.8)
     raise last_err
 
 
@@ -202,6 +210,29 @@ def _last_cache_date(path):
         return ""
 
 
+def _recent_trading_days(end_date, n=5):
+    """返回 end_date（含）往前 n 个交易日，升序。日历不可用时退化为自然日减天数。"""
+    try:
+        from trade_calendar import is_trading_day
+    except Exception:
+        try:
+            from .trade_calendar import is_trading_day
+        except Exception:
+            is_trading_day = None
+    out = []
+    try:
+        d = pd.Timestamp(end_date)
+    except Exception:
+        return out
+    guard = 0
+    while len(out) < n and guard < n * 4 + 20:
+        if is_trading_day is None or is_trading_day(d.date()):
+            out.append(d.strftime("%Y-%m-%d"))
+        d -= pd.Timedelta(days=1)
+        guard += 1
+    return sorted(out)
+
+
 def _ensure_klines_fresh(codes, quiet=True, time_budget=420):
     """轻量增量补数（2026-09-22 方案A 任务#11）。
 
@@ -214,6 +245,14 @@ def _ensure_klines_fresh(codes, quiet=True, time_budget=420):
     CSV末行日期（秒级、零网络），仅对落后票定向补齐：正常日落后0只秒过；
     缓存有缺口/昨日复盘漏跑时自动定向补。复盘链路另有 A3 当日行追加自愈，
     本函数兜底历史缺口。
+
+    2026-10-23 修复（拉卡拉重复登记根因）：原实现只比较**末行日期**，若缓存
+    缺的是**中间某一天**（10-22 凌晨补跑时末行仍为 10-21，10-23 复盘又把当日
+    行直接追加在 10-21 之后），末行日期已是最新 → 判为不落后 → 中间缺口永久
+    留存。此前表现为 1008/1419 只票缺 10-22 整行，初动池拿 10-21 数据当 10-22
+    信号，同一形态被登记两次。
+    现在增加对基准日及其前一交易日的文本存在性校验：只要基准日缺席即算落后，
+    交给 _fetch_tencent 全量拉取 + _merge_klines 补回中间行（已存在日期保留原值）。
 
     返回 (落后票数, 实际补齐票数, 基准日期)。
     指数拉取失败时退化为局部模式：以缓存众数日期为基准，只补局部落后票。"""
@@ -229,7 +268,24 @@ def _ensure_klines_fresh(codes, quiet=True, time_budget=420):
         pass
     if not expected:
         expected = Counter(d for d in dates.values() if d).most_common(1)[0][0]
-    stale = [s for s, d in dates.items() if not d or d < expected]
+    # 2026-10-23 二次修复（原实现只查基准日，仍漏中间缺口）：
+    # 10-22 案例中 10-23 当日行已被 A3 追加，基准日在场 → 判为不落后 → 10-22 永久缺失。
+    # 现改为校验「基准日往前 5 个交易日」全部在场，任一天缺席即算落后。
+    # 连续停牌票会因源本身无该日数据而反复被判落后，代价只是每日多拉几次，可接受；
+    # 且 update_klines 用 _merge_klines 合并不覆盖已有行，不会污染。
+    recent = _recent_trading_days(expected, 5)
+    stale = []
+    for s, d in dates.items():
+        if not d or d < expected:
+            stale.append(s)
+            continue
+        try:
+            txt = (KLINE_DIR / f"{s}.csv").read_text(encoding="utf-8-sig", errors="ignore")
+        except Exception:
+            stale.append(s)
+            continue
+        if any(day not in txt for day in recent):
+            stale.append(s)
     if not stale:
         return 0, 0, expected
     if not quiet:

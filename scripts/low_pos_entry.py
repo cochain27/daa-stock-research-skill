@@ -170,9 +170,23 @@ def _load_hist(code, days=180):
             _last_row = None
         _expect = None
         try:
-            from trade_calendar import next_trading_day
-            from datetime import date as _date
-            _expect = str(next_trading_day(_date.today()))
+            # 2026-10-22 修复：原用 next_trading_day(date.today())，跨零点补跑时今天是
+            #   新交易日(10-23)但当日 K 线尚不存在 → 全军「补行失败→弃用」，低位池 0 候选、
+            #   审计落盘 candidates_unknown.csv（10-22 事故）。改为「最近已收盘交易日」：
+            #   1) 有 DAA_REPORT_DATE 时直接用该报告日；2) 否则取今天，若今天 15:00 未到则回退上一交易日。
+            _os_env = __import__("os").environ.get("DAA_REPORT_DATE")
+            if _os_env:
+                _expect = _os_env
+            else:
+                from trade_calendar import next_trading_day, is_trading_day
+                from datetime import date as _date, datetime as _dt, timedelta as _td
+                _now = _dt.now()
+                _d = _now.date()
+                if is_trading_day(_d) and _now.hour < 15:
+                    _d = _d - _td(days=1)          # 当日未收盘，看上一交易日
+                    while not is_trading_day(_d):
+                        _d = _d - _td(days=1)
+                _expect = str(next_trading_day(_d))
         except Exception:
             _expect = str(datetime.now().strftime("%Y-%m-%d"))
         if _last_row is not None and _last_row < _expect:
@@ -661,7 +675,7 @@ def pick_low_pos_entry(as_of=None, top=1500, quiet=False):
 
 # ---------------- 观察池去重（2026-09-21 修低位池膨胀） ----------------
 
-def filter_active_pool(picks):
+def filter_active_pool(picks, today=None):
     """剔除已在观察池在册（最新状态=观察中）的票。
 
     背景（2026-09-21）：09-21 单日入池 22 只，其中宁德/兆易/东财/烽火等 4 只
@@ -669,21 +683,31 @@ def filter_active_pool(picks):
     排除了短线/趋势跟踪池（track_rows），从未排除低位池自己在册的票。
     规则：最新状态=「观察中」→ 剔除（老票只进连续追踪段）；
           「已失效」（T+5 超时/止损移出）→ 允许重新入池（新信号）。
+
+    2026-10-23 修复（同日重跑候选表变空）：传入 today 时，**今日已归档**的
+    记录不算「老票」。原实现把当日自己归档的行也算 active → 同日重跑（数据
+    修复后重算、人工补跑）时候选全被自己的记录筛掉，候选表变空、明日晚关注
+    也随之丢失。历史日期的在册记录仍按原规则剔除。
     """
     import csv as _csv
     path = DATA_DIR / "watch_history.csv"
     if not path.exists() or not picks:
         return picks
     latest = {}
+    latest_day = {}
     try:
         with path.open(encoding="utf-8") as f:
             for r in _csv.DictReader(f):
                 c = (r.get("代码") or "").strip()
                 if c:
                     latest[c] = (r.get("状态") or "").strip()
+                    d = (r.get("日期") or "").strip()
+                    if d >= latest_day.get(c, ""):
+                        latest_day[c] = d
     except Exception:
         return picks
-    active = {c for c, st in latest.items() if st == "观察中"}
+    active = {c for c, st in latest.items()
+              if st == "观察中" and (not today or latest_day.get(c, "") < today)}
     if not active:
         return picks
     return [p for p in picks if str(p.get("代码", "")) not in active]

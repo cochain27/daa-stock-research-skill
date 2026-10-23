@@ -135,18 +135,48 @@ def _refresh_heat_today(today):
             print("[板块热度] 无任何板块K线数据")
             return None
         day = max(got)
+        # 2026-10-23 修复（领涨/领跌同板块自相矛盾）：THS 板块指数接口部分失败时，
+        # got[day] 可能只有个位数条数，原逻辑照单全收并**覆盖写盘** → 当日 90 条被削成 7 条，
+        # 领涨5+领跌3 在 <8 条里必重叠，曾出现「饮料制造」同时进领涨与领跌。
+        # 现改为：覆盖度不足 60% 时视为数据不完整，既不写盘也不拿它做排行，
+        # 直接退回上一交易日的完整快照（补数用 scripts/fix_heat_day.py）。
+        _n, _tot = len(got[day]), len(boards)
+        if _tot and _n < _tot * 0.6:
+            print(f"[板块热度] ⚠️ {day} 仅 {_n}/{_tot} 条，覆盖不足，跳过写盘并退回完整快照")
+            prev = {}
+            if INDUSTRY_HEAT_FILE.exists():
+                with INDUSTRY_HEAT_FILE.open(encoding="utf-8") as f:
+                    for r in _csv.DictReader(f):
+                        d = r.get("日期") or ""
+                        if d < day and (r.get("板块") or ""):
+                            prev.setdefault(d, {})[r["板块"]] = r["涨跌幅"]
+            if prev:
+                pd_ = max(prev)
+                return pd.DataFrame([{"板块名称": k, "涨跌幅": float(v)}
+                                     for k, v in prev[pd_].items()])
+            return None
+        # 写盘改为「合并覆盖」：先保留当日已有行，再用本次实测值覆盖同板块，
+        # 避免部分板块抓取失败时把当日完整快照削成残缺版（原实现是整日先删后写）。
+        merged = {}
+        if INDUSTRY_HEAT_FILE.exists():
+            with INDUSTRY_HEAT_FILE.open(encoding="utf-8") as f:
+                for r in _csv.DictReader(f):
+                    if r.get("日期") == day and r.get("板块"):
+                        merged[r["板块"]] = r["涨跌幅"]
+        for name, pct in got[day].items():
+            merged[name] = f"{pct:.2f}"
         rows = []
         if INDUSTRY_HEAT_FILE.exists():
             with INDUSTRY_HEAT_FILE.open(encoding="utf-8") as f:
                 rows = [r for r in _csv.DictReader(f) if r.get("日期") != day]
-        for name, pct in got[day].items():
-            rows.append({"日期": day, "板块": name, "涨跌幅": f"{pct:.2f}"})
+        for name, pct in merged.items():
+            rows.append({"日期": day, "板块": name, "涨跌幅": pct})
         rows.sort(key=lambda x: (x["日期"], x["板块"]))
         with INDUSTRY_HEAT_FILE.open("w", newline="", encoding="utf-8") as f:
             w = _csv.DictWriter(f, fieldnames=["日期", "板块", "涨跌幅"])
             w.writeheader()
             w.writerows(rows)
-        print(f"[板块热度] THS板块 {day} 刷新 {len(got[day])}/90 条")
+        print(f"[板块热度] THS板块 {day} 刷新 {len(got[day])}/{len(boards)} 条（合并后 {len(merged)} 条）")
         return pd.DataFrame([{"板块名称": n, "涨跌幅": p} for n, p in got[day].items()])
     except Exception as e:
         print(f"[板块热度] 刷新失败 {e}")
@@ -244,7 +274,33 @@ def _archive_watch(watch, today):
 
     # 同日已写过则跳过（幂等），否则以追加模式落盘，历史行零接触
     if has_today:
-        return path
+        # 2026-10-23 修复（同日重跑幽灵行）：数据修复后重算（DAA_FORCE_RUN=1）时，
+        # 当日归档多为盘中口径（15:10 那次用午盘数据选出的票），收盘重算后 TOPN 截断
+        # 结果可能变化 → 旧行成为孤儿，永久留在池里被连续追踪。强制重跑时按本次
+        # 筛选结果对齐当日行（先删当日、再写本次），非强制跑仍保持严格幂等。
+        if _os.environ.get("DAA_FORCE_RUN") != "1":
+            return path
+        try:
+            with path.open(encoding="utf-8") as f:
+                old = list(csv.DictReader(f))
+            fields = list(old[0].keys()) if old else list(WATCH_FIELDS)
+            keep = [r for r in old if r.get("日期") != today]
+            old_today = [r for r in old if r.get("日期") == today]
+            if old_today and len(new_rows) < len(old_today) * 0.5:
+                print(f"[低位观察池] ⚠️ 重跑候选 {len(new_rows)} 只 < 当日已有 {len(old_today)} 只的半数，"
+                      f"疑似筛选降级，保持原样不覆盖")
+                return path
+            with path.open("w", newline="", encoding="utf-8") as f:
+                wr = csv.DictWriter(f, fieldnames=fields)
+                wr.writeheader()
+                wr.writerows(keep)
+                wr.writerows(new_rows)
+            if len(old_today) != len(new_rows):
+                print(f"[低位观察池] 强制重跑对齐当日入池：{len(old_today)} → {len(new_rows)} 只")
+            return path
+        except Exception as e:
+            print(f"[低位观察池] 重跑对齐失败（保持原样）: {e}")
+            return path
 
     with path.open("a", newline="", encoding="utf-8") as f:
         wr = csv.DictWriter(f, fieldnames=WATCH_FIELDS)
@@ -659,18 +715,24 @@ def run_close():
     #   2) 再生成收盘复盘 → 自然包含"今日推荐表现追踪 + 低位观察池 + 明日关注"，
     #      晨报的市场温度/板块/风险日历等有价值内容已由复盘承载，微信每日只推 1 次。
     # 失败不影响复盘主流程（选股异常仅告警，复盘仍按已有 today_picks 生成）。
+    # 2026-10-23 新增 DAA_SKIP_SELECT_TRIGGER=1：数据修复后重算复盘时跳过选股触发，
+    # 避免用修正后数据二次改写台账/今日推荐（当日登记已完成）。
+    _skip_sel = os.environ.get("DAA_SKIP_SELECT_TRIGGER") == "1"
+    if _skip_sel:
+        print("[选股触发] 已跳过（DAA_SKIP_SELECT_TRIGGER=1），按存量 picks 生成复盘")
     try:
         import subprocess, sys as _sys
         _sel_log = BASE / "data" / "selection_trigger.log"
-        _ret = subprocess.run(
-            [_sys.executable, "_run_daily_wrapper.py", "--no-push"],
-            cwd=str(BASE / "scripts"), timeout=1800,
-            capture_output=True, text=True)
-        _sel_log.write_text(_ret.stdout[-3000:] + _ret.stderr[-1000:], encoding="utf-8")
-        if _ret.returncode == 0:
-            print("[选股触发] daily_report --no-push 完成（台账/today_picks 已更新）")
-        else:
-            print(f"[选股触发] ⚠️ daily_report 退出码 {_ret.returncode}，复盘按存量数据生成（详见 data/selection_trigger.log）")
+        if not _skip_sel:
+            _ret = subprocess.run(
+                [_sys.executable, "_run_daily_wrapper.py", "--no-push"],
+                cwd=str(BASE / "scripts"), timeout=1800,
+                capture_output=True, text=True)
+            _sel_log.write_text(_ret.stdout[-3000:] + _ret.stderr[-1000:], encoding="utf-8")
+            if _ret.returncode == 0:
+                print("[选股触发] daily_report --no-push 完成（台账/today_picks 已更新）")
+            else:
+                print(f"[选股触发] ⚠️ daily_report 退出码 {_ret.returncode}，复盘按存量数据生成（详见 data/selection_trigger.log）")
     except Exception as e:
         print(f"[选股触发] ⚠️ 异常（{e}），复盘按存量数据生成")
 
@@ -960,7 +1022,7 @@ def run_close():
         # 2026-09-21 修低位池膨胀：filter_active_pool 剔除已在池（观察中）老票，
         #   此前只排除短线/趋势跟踪池（track_rows），宁德/兆易/东财/烽火等
         #   在册票每日重刷「今日候选」并入池记录，池子持续膨胀。
-        candidates = filter_active_pool(pick_low_pos_entry(top=600, quiet=True))
+        candidates = filter_active_pool(pick_low_pos_entry(top=600, quiet=True), today=today)
         # 排除已在跟踪池的票
         # 2026-09-18 改：去掉 [:3] 截断，与晨报显示全量保持一致（池子一致性）
         watch = [w for w in candidates if w.get("代码") not in track_codes]
@@ -1191,12 +1253,17 @@ def run_close():
         tpath.write_text(json.dumps(track, ensure_ascii=False, indent=1), encoding="utf-8")
     print(out[:900])
     print(f"\n[收盘复盘已保存] {path}")
-    try:
-        from notify import push_report
-        ok, ch, msg = push_report(f"收盘复盘 {today}", out)
-        print(f"[微信推送] {'成功' if ok else '跳过/失败: '+msg}")
-    except Exception as e:
-        print(f"[微信推送] 异常(内容已保存本地): {e}")
+    # 2026-10-23 新增 DAA_NO_PUSH=1：数据修复后重生成复盘时跳过微信，避免同一天二次打扰。
+    # （此前复盘固定推送，本地修正只能手改 md，无法整篇重算。）
+    if os.environ.get("DAA_NO_PUSH") == "1":
+        print("[微信推送] 已跳过（DAA_NO_PUSH=1）")
+    else:
+        try:
+            from notify import push_report
+            ok, ch, msg = push_report(f"收盘复盘 {today}", out)
+            print(f"[微信推送] {'成功' if ok else '跳过/失败: '+msg}")
+        except Exception as e:
+            print(f"[微信推送] 异常(内容已保存本地): {e}")
 
     # 策略笔记本自动更新（每策略一本，每日推荐流水+跟踪状态）
     # 2026-09-21：新增策略笔记本体系。warm 复用本次已扫描结果（避免重复拉 K 线）。
