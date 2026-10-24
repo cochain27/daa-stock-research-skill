@@ -24,6 +24,85 @@ OPEN_STATUS = ("持有中", "止盈1减半", "展期中")
 
 # ===== 通用工具 =====
 
+_INDEX_KLINE = DATA_DIR / "index_klines" / "sh000001.csv"
+_TRADE_DAYS_CACHE = None
+
+
+def _trade_day_set():
+    """本地交易日集合。
+
+    数据源优先级（2026-10-23 修正）：
+      ① `trade_calendar`（法定休市公告口径，**波动性最低、覆盖全年**）
+      ② 指数K线 `data/index_klines/sh000001.csv`（⚠ 该文件由研究脚本按需生成，
+         长期不更新——实测 2026-10-23 时最新只到 09-18，若当主源会让 9-18 后的
+         所有跨度退化成自然日，等于修复白做，故仅作交叉校验/兜底）
+    结果缓存，避免每次调用重复计算。
+    """
+    global _TRADE_DAYS_CACHE
+    if _TRADE_DAYS_CACHE is not None:
+        return _TRADE_DAYS_CACHE
+    days = set()
+    try:
+        from trade_calendar import holiday_set, HOLIDAY_RANGES
+        from datetime import date, timedelta
+        d = date(min(HOLIDAY_RANGES) - 1, 1, 1) if HOLIDAY_RANGES else date(2019, 1, 1)
+        end = date.today() + timedelta(days=40)
+        while d <= end:
+            if d not in holiday_set(d.year):
+                days.add(d.strftime("%Y-%m-%d"))
+            d += timedelta(days=1)
+    except Exception:
+        days = set()
+    if not days:
+        try:
+            if _INDEX_KLINE.exists():
+                with open(_INDEX_KLINE, encoding="utf-8-sig") as f:
+                    for r in csv.DictReader(f):
+                        dd = (r.get("date") or r.get("日期") or "").strip()[:10]
+                        if dd:
+                            days.add(dd)
+        except Exception:
+            days = set()
+    _TRADE_DAYS_CACHE = days
+    return days
+
+
+def trade_day_span(start_date, end_date):
+    """start→end 的**交易日跨度**（含两端同一天计 1）。
+
+    2026-10-23 修复：全项目「持有 N 天」阈值原用自然日差（datetime.days），
+    周五建仓→周一即被算作 3 天，时间止损/硬上限/技术面「第N天」全部提前 1~N 个交易日触发。
+    口径与 `low_pos_tracker._count_trade_days` 一致（含两端）。
+    退化：无交易日历时回退自然日差（宁可宽松，不可漏判）。
+    """
+    if not start_date or not end_date:
+        return 0
+    s, e = str(start_date)[:10], str(end_date)[:10]
+    if e < s:
+        s, e = e, s
+    days = _trade_day_set()
+    if days:
+        n = len([d for d in days if s <= d <= e])
+        if n:
+            return n
+    try:
+        return (datetime.strptime(e, "%Y-%m-%d") - datetime.strptime(s, "%Y-%m-%d")).days + 1
+    except Exception:
+        return 0
+
+
+def trade_days_held(start_date, end_date):
+    """已持有**交易日数**（不含建仓日当天）。
+
+    与 short/trend 原自然日口径严格对齐的替换：
+      原式 (end - start).days → 10-09(五)买、10-12(一)算 = 3 天（错，实为 1 个交易日）
+      新式 trade_days_held → 10-09→10-12 = 1；10-13→10-16 = 3（与 10-16 踩坑日记的
+      「灵康药业才是真正 3 交易日」一致）
+    仅用于「持有 N 天后触发」类阈值；T+30「含触发日」类阈值请直接用 trade_day_span。
+    """
+    return max(trade_day_span(start_date, end_date) - 1, 0)
+
+
 def _is_extended(r):
     """判断某条台账记录是否已处于展期状态"""
     return r["状态"] == "展期中" or ("展期" in (r.get("备注") or ""))
@@ -103,7 +182,8 @@ def virtual_nav_by_tag(log_path, tag):
             except (ValueError, TypeError):
                 continue
             ret_pct = (price / vcost - 1) * 100
-            pnl = VIRTUAL_TRADE_AMOUNT * ret_pct / 100
+            # 2026-10-23：浮动盈亏按**剩余仓位**计提，减半后不再按全仓虚增浮盈
+            pnl = VIRTUAL_TRADE_AMOUNT * _remain_ratio(r) * ret_pct / 100
             floating += pnl
             open_count += 1
 
@@ -123,34 +203,82 @@ def virtual_nav_by_tag(log_path, tag):
 
 # ===== 通用虚拟了结写入 =====
 
+# 2026-10-23 新增：分批止盈记账
+#   原实现只有「一次性了结」，+15% 减半只在台账状态上打个标记、不落虚拟交易，
+#   导致半仓那部分收益**既不计已实现、也没锁进净值**（海正药业 +16.92% 减半后
+#   净值里仍是全仓浮动，等于分批止盈完全没生效）。
+#   现在引入「虚拟剩余比例」列：减半时按 VIRTUAL_TRADE_AMOUNT×比例 结算一笔，
+#   余仓按剩余比例计浮动；彻底清仓时剩余比例归零，避免重复记账。
+VIRTUAL_REMAIN_FIELD = "虚拟剩余比例"
+
+
+def _remain_ratio(r):
+    """当前剩余仓位比例（0~1），缺列/脏数据按 1.0（全仓）处理。"""
+    try:
+        v = float(r.get(VIRTUAL_REMAIN_FIELD) or 1.0)
+    except (TypeError, ValueError):
+        return 1.0
+    return min(max(v, 0.0), 1.0)
+
+
+def _append_vtrade(vtrade_list, r, price, reason, ratio, vcost):
+    """按比例写一条虚拟交易记录。ratio 为本次了结的仓位占比（0~1）。"""
+    amount = VIRTUAL_TRADE_AMOUNT * ratio
+    ret_pct = (price / vcost - 1) * 100
+    pnl = amount * ret_pct / 100
+    rec_day = r.get("虚拟建仓日") or r.get("触发日") or r["日期"]
+    days = trade_day_span(rec_day, r["最后更新"])
+    vtrade_list.append({
+        "虚拟建仓日": rec_day,
+        "代码": r["代码"],
+        "名称": r["名称"],
+        "虚拟成本": f"{vcost:.2f}",
+        "虚拟了结日": r["最后更新"],
+        "了结方式": reason,
+        "了结价": f"{price:.2f}",
+        "浮动盈亏%": f"{ret_pct:.2f}",
+        "已实现盈亏": f"{pnl:.0f}",
+        "持有天数": str(days),
+        "策略标签": r.get("策略标签", ""),
+        "最高收益%": r.get("最高收益%", ""),
+    })
+
+
+def record_partial(r, vtrade_list, price, reason, part=0.5):
+    """分批止盈：了结当前剩余仓位的 `part`（默认一半），余仓继续持有。
+    幂等：同一比例不会重复结算（剩余比例已下降则跳过）。
+    返回实际了结的仓位占比（0 表示未记账）。
+    """
+    if r.get("虚拟建仓状态") != "已建仓":
+        return 0.0
+    try:
+        vcost = float(r["虚拟成本"])
+    except (ValueError, TypeError):
+        return 0.0
+    remain = _remain_ratio(r)
+    if remain <= 0.001:
+        return 0.0
+    sold = round(remain * part, 4)
+    if sold <= 0:
+        return 0.0
+    _append_vtrade(vtrade_list, r, price, f"{reason}（{sold:.0%}仓）", sold, vcost)
+    r[VIRTUAL_REMAIN_FIELD] = f"{max(remain - sold, 0):.4f}"
+    return sold
+
+
 def record_settlement(r, vtrade_list, settle_price, reason):
-    """当虚拟建仓票了结时，同步记录到虚拟交易台账"""
+    """当虚拟建仓票了结时，同步记录到虚拟交易台账（只结算剩余仓位）。"""
     if r.get("虚拟建仓状态") != "已建仓":
         return
     try:
         vcost = float(r["虚拟成本"])
-        rec_day = r.get("虚拟建仓日") or r["日期"]
-        days = (datetime.strptime(r["最后更新"], "%Y-%m-%d") -
-                datetime.strptime(rec_day, "%Y-%m-%d")).days
-        ret_pct = (settle_price / vcost - 1) * 100
-        pnl = VIRTUAL_TRADE_AMOUNT * ret_pct / 100
-        vtrade_list.append({
-            "虚拟建仓日": rec_day,
-            "代码": r["代码"],
-            "名称": r["名称"],
-            "虚拟成本": f"{vcost:.2f}",
-            "虚拟了结日": r["最后更新"],
-            "了结方式": reason,
-            "了结价": f"{settle_price:.2f}",
-            "浮动盈亏%": f"{ret_pct:.2f}",
-            "已实现盈亏": f"{pnl:.0f}",
-            "持有天数": str(days),
-            "策略标签": r.get("策略标签", ""),
-            "最高收益%": r["最高收益%"],
-        })
-        r["虚拟建仓状态"] = "已了结"
     except (ValueError, TypeError):
-        pass
+        return
+    remain = _remain_ratio(r)
+    if remain > 0.001:
+        _append_vtrade(vtrade_list, r, settle_price, reason, remain, vcost)
+    r[VIRTUAL_REMAIN_FIELD] = "0"
+    r["虚拟建仓状态"] = "已了结"
 
 
 # ===== 通用技术面破坏检测 =====

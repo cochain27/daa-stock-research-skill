@@ -23,7 +23,8 @@ from config import (
 )
 from tracker_common import (
     _read_rows, _write_rows, _vtrade_read, _vtrade_write,
-    record_settlement, virtual_nav_by_tag,
+    record_settlement, record_partial, virtual_nav_by_tag, trade_day_span,
+    _remain_ratio, VIRTUAL_REMAIN_FIELD,
 )
 
 OPEN_STATUS = ("持有中", "止盈1减半")
@@ -42,7 +43,7 @@ def _ledger_fields():
     """低位触发台账字段（复用趋势台账结构 + 触发专用列）"""
     return ["日期", "代码", "名称", "自研评分", "策略标签", "验证评分", "基准价", "买区", "止损",
             "止盈1", "止盈2", "虚拟成本", "虚拟建仓日", "虚拟建仓状态", "状态", "最高收益%",
-            "最后更新", "备注", "触发价", "触发日", "入池日"]
+            "最后更新", "备注", "触发价", "触发日", "入池日", "虚拟剩余比例"]
 
 
 def check_and_init():
@@ -65,6 +66,8 @@ def _fired_date_from_watch(code):
     """反推该票首次「已触发」落盘日（watch_history 最早 已触发=1 的行）。
     存量已触发票（如中国电影 09-08 触发）回补台账时，触发日必须用真实触发日，
     否则 T+30 从入账日算起，超过 T+30 的存量票永远触发不了自动离场。
+    2026-10-23：优先读「触发日」列（close_review 首触发固化写入），无该列时
+    回退 earliest 已触发行日期。
     """
     if not WATCH_HISTORY.exists():
         return None
@@ -73,7 +76,7 @@ def _fired_date_from_watch(code):
             rd = list(csv.DictReader(f))
         for r in rd:
             if r.get("代码") == code and str(r.get("已触发")) == "1":
-                return r.get("日期") or None
+                return r.get("触发日") or r.get("日期") or None
     except Exception:
         return None
     return None
@@ -114,10 +117,14 @@ def register_fired(fired_rows, today=None):
             "自研评分": "", "策略标签": STRATEGY_TAG, "验证评分": "",
             "基准价": f"{base:.2f}", "买区": fr.get("buy_zone", ""), "止损": f"{stop:.2f}",
             "止盈1": f"{base * (1 + TP_HALF):.2f}", "止盈2": f"{base * (1 + TP_FULL):.2f}",
-            "虚拟成本": f"{tp:.2f}", "虚拟建仓日": today, "虚拟建仓状态": "已建仓",
+            # 2026-10-23 修复：虚拟建仓日/建仓状态时间必须用**触发日**，不能写入账日 today
+            #   （此前 600977 触发 10-08、入账 10-20 → 建仓日错 12 天，T+30 到期日与持有天数全错）
+            "虚拟成本": f"{tp:.2f}", "虚拟建仓日": fired_day, "虚拟建仓状态": "已建仓",
             "状态": "持有中", "最高收益%": "0", "最后更新": today, "备注": "低位触发启动入账",
             "触发价": f"{tp:.2f}", "触发日": fired_day,
             "入池日": fr.get("first_date", ""),
+            # 2026-10-23：分批止盈记账用——新建仓默认全仓 1.0，减半后降到 0.5
+            VIRTUAL_REMAIN_FIELD: "1",
         })
         open_codes.add(code)
         added += 1
@@ -127,19 +134,10 @@ def register_fired(fired_rows, today=None):
 
 
 def _count_trade_days(start_date, end_date):
-    """数 start_date..end_date 的交易日个数（上证指数K线，含两端）。
-    失败时退回自然日天数（口径略松，仅兜底）。"""
-    try:
-        df = get_stock_hist("000001", days=90)
-        if df is not None and not df.empty:
-            days = [str(d)[:10] for d in pd.to_datetime(df["日期"]).dt.strftime("%Y-%m-%d")]
-            return len([d for d in days if start_date <= d <= end_date])
-    except Exception:
-        pass
-    try:
-        return (datetime.strptime(end_date, "%Y-%m-%d") - datetime.strptime(start_date, "%Y-%m-%d")).days + 1
-    except Exception:
-        return 1
+    """数 start_date..end_date 的交易日个数（含两端）。
+    2026-10-23：改用 tracker_common.trade_day_span（读本地指数K线，零网络请求），
+    原实现每次调 get_stock_hist('000001') 会拉网络，一轮体检几十次调用极慢。"""
+    return trade_day_span(start_date, end_date)
 
 
 def _ma_today(code, window):
@@ -246,6 +244,8 @@ def update_track(today=None):
             if r["状态"] != "止盈1减半":
                 r["状态"] = "止盈1减半"
                 r["备注"] = f"达+{TP_HALF*100:.0f}%减半仓，余仓看破MA{TRAIL_MA}"
+                # 2026-10-23 修复：减半必须落虚拟交易（原先只改状态，半仓收益不进净值）
+                record_partial(r, vtrade, price, f"低位止盈1减半(+{TP_HALF*100:.0f}%)", 0.5)
             else:
                 r["备注"] = f"减半后持有中（峰值{peak:+.1f}%）"
         updated += 1
@@ -284,10 +284,12 @@ def stats():
 def analyze_track_pool():
     """低位触发持仓跟踪池分析（供收盘复盘展示，返回 overview 含虚拟净值）"""
     check_and_init()
-    rows = _open_rows()
+    # 2026-10-23 修复：_open_rows() 返回全量台账（含已结清），必须按 OPEN_STATUS 过滤，
+    # 否则已离场票会被当成「✅持有」展示，并把已了结收益重复计入池内总盈亏。
+    rows = [r for r in _open_rows() if r["状态"] in OPEN_STATUS]
     if not rows:
         return [], {"总只数": 0, "总盈亏": 0, "平均盈亏": 0, "破止损": 0,
-                    "建议": "低位触发跟踪池为空", "虚拟净值": None}
+                    "建议": "低位触发跟踪池为空（无持有中标的）", "虚拟净值": None}
     quotes = get_realtime_quotes([r["代码"] for r in rows])
     analyzed = []
     stop_count = 0
@@ -310,7 +312,8 @@ def analyze_track_pool():
             continue
         ret = (price / base - 1) * 100
         peak = max(float(r["最高收益%"] or 0), ret)
-        total_pnl += ret
+        # 2026-10-23：池内总盈亏按**剩余仓位**加权，减半票不再按全仓计入（否则虚增）
+        total_pnl += ret * _remain_ratio(r)
         stop = base * (1 + STOP)
         ma5 = _ma_today(code, TRAIL_MA) if TRAIL_MA else None
         broke_ma5 = bool(ma5 and price < ma5)

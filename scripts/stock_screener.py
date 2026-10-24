@@ -20,7 +20,7 @@ from config import (SCORE_WEIGHTS, ALLOW_CODE_PREFIX, MAX_SAME_INDUSTRY,
                     SWING_MAX_PICKS,
                     TREND_ENABLED, TREND_MAX_PICKS, TREND_MIN_MARKET_CAP,
                     TREND_MIN_60D_POS, TREND_MIN_60D_POS_LOW, TREND_MAX_20D_AMPLITUDE, TREND_MAX_20D_STD_RATIO,
-                    TREND_BREAKOUT_VOL_RATIO, TREND_MIN_AMOUNT,
+                    TREND_BREAKOUT_VOL_RATIO, TREND_MIN_AMOUNT, TREND_SCAN_LIMIT,
                     TREND_BREAKOUT_CHG_RANGE, TREND_HOLD_DAYS, TREND_EXTEND_MAX_DAYS,
                     TREND_STOP_LOSS, TREND_TAKE_PROFIT_1, TREND_TAKE_PROFIT_2,
                     SHORTLINE_MAX_UPPER_SHADOW,
@@ -1246,11 +1246,23 @@ def pick_trend_stocks(snapshot=None, boards=None, n=2, exclude_codes=None):
     df = df[df["最新价"].notna() & (df["最新价"] > 0)]
     # 成交额过滤
     df = df[pd.to_numeric(df["成交额"], errors="coerce").fillna(0) > TREND_MIN_AMOUNT]
-    # 活跃度排序取前100只做技术扫描
+    # 2026-10-23 修复（趋势池连续 2 周 0 出票的根因）：
+    # 原逻辑「按换手率取前 100 只做技术扫描」是结构性漏票——换手率高的票天然是
+    # 题材/小盘活跃股，而趋势票的形态是「横盘紧凑后首次放量突破」，换手率通常
+    # 排在全市场 150~950 名。离线全池重放（scripts/trend_funnel_diag.py）验证：
+    # 10-12~10-23 有 9 只票通过全部 10 道条件，但其成交额排名 139~944，
+    # 全部落在 head(100) 之外 → 筛选器永远看不到它们，与阈值宽严无关。
+    # 修法：先用快照自带「涨跌幅」做零成本粗筛（放量突破当日必涨 3-7%，这里
+    # 放宽到 2.5-8.0% 容纳盘中/收盘口径差），再按换手率排序限量，兼顾覆盖率与
+    # 请求次数（粗筛后典型 80-280 只，技术扫描请求量可控）。
+    chg_min, chg_max = TREND_BREAKOUT_CHG_RANGE
+    if "涨跌幅" in df.columns:
+        _chg = pd.to_numeric(df["涨跌幅"], errors="coerce")
+        df = df[_chg.between(chg_min * 100 - 0.5, chg_max * 100 + 1.0) | _chg.isna()]
     if "换手率" in df.columns:
         df["_liq"] = df["换手率"].fillna(0).clip(0, 15)
         df = df.sort_values("_liq", ascending=False)
-    cand = df.head(100)
+    cand = df.head(TREND_SCAN_LIMIT)
 
     picks = []
     codes = cand["代码"].tolist()

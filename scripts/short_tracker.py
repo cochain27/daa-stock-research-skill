@@ -23,8 +23,8 @@ from config import (
 )
 from tracker_common import (
     _read_rows, _write_rows, _vtrade_read, _vtrade_write,
-    record_settlement, tech_break, virtual_nav_by_tag,
-    check_virtual_settled,
+    record_settlement, record_partial, tech_break, virtual_nav_by_tag,
+    check_virtual_settled, trade_day_span, trade_days_held,
 )
 
 OPEN_STATUS = ("持有中", "止盈1减半")
@@ -192,8 +192,7 @@ def roll_backtest():
         if buy_price is None or buy_price <= 0:
             continue
         ret_pct = (sell_open / buy_price - 1) * 100
-        hold_days = (datetime.strptime(actual_sell_date, "%Y-%m-%d") -
-                     datetime.strptime(buy_day, "%Y-%m-%d")).days
+        hold_days = trade_days_held(buy_day, actual_sell_date)
         pnl = 10000 * ret_pct / 100
         r["卖出日"] = actual_sell_date
         r["卖出价(第三天开盘价)"] = f"{sell_open:.2f}"
@@ -242,7 +241,9 @@ def update_track():
 
         tp1_target = base * (1 + SHORT_TP1)
         tp2_target = base * (1 + SHORT_TP2)
-        days = (datetime.strptime(today, "%Y-%m-%d") - datetime.strptime(r["日期"], "%Y-%m-%d")).days
+        # 2026-10-23 修复：持有天数改**交易日**跨度（原自然日差，周五→周一被算成3天，
+        #   时间止损/硬上限提前1~2个交易日触发，10-09 天赐材料/新华百货被误砍即此因）
+        days = trade_days_held(r["日期"], today)
 
         # 技术面破坏检测（第2天起）
         tech_broken, tech_reason = tech_break(r, price, mode="short") if days >= 1 else (False, "")
@@ -275,6 +276,8 @@ def update_track():
             if r["状态"] != "止盈1减半":
                 r["状态"] = "止盈1减半"
                 r["备注"] = f"达+{SHORT_TP1*100:.0f}%减半仓，剩余仓位移动止损(MA10)"
+                # 2026-10-23：减半必须落虚拟交易（原先只改状态不记账，半仓收益凭空消失）
+                record_partial(r, vtrade, price, f"止盈1减半(+{SHORT_TP1*100:.0f}%)", 0.5)
             else:
                 r["备注"] = f"减半后持有中(峰值{hi:+.1f}%)"
         updated += 1
@@ -317,7 +320,7 @@ def analyze_track_pool():
         except (ValueError, TypeError):
             continue
 
-        days = (datetime.strptime(r["最后更新"], "%Y-%m-%d") - datetime.strptime(r["日期"], "%Y-%m-%d")).days
+        days = trade_days_held(r["日期"], r["最后更新"])
 
         if q.get("最高", -1) == 0:
             analyzed.append({

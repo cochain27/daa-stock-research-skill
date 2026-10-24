@@ -59,7 +59,9 @@ def generate_full_report(temp, details, pos_advice, boards, picks, rps_rows=None
     """生成完整日报 markdown"""
     today = TODAY
     lines = []
-    # 三池分组（速览与推荐个股共用；短线激进/右侧趋势为正式策略1、2，初动池为第3策略，低位埋伏为观察池）
+    # 四池分组（速览与推荐个股共用；短线激进/右侧趋势为正式策略1、2，初动池为第3策略，
+    #   低位启动观察池为第4池——触发后进「低位触发」台账，与前三池并列计入虚拟净值。
+    #   2026-10-23：原文案与口径都还是"三池"，实际已有四本台账，全文案统一改四池。）
     short_list = [p for p in picks if _is_short(p)]
     trend_list = [p for p in picks if _is_trend(p)]
     band_list = [p for p in picks if p.get("strategy_tag") not in ("短线", "趋势")]  # 旧波段兼容
@@ -71,7 +73,7 @@ def generate_full_report(temp, details, pos_advice, boards, picks, rps_rows=None
     env_s = f"环境【{market_env}】｜ " if market_env else ""
     lines.append(f"**市场温度：{temp:.0f}/100** ｜ {env_s}**仓位建议：{pos_advice[0]}**")
     lines.append(f"{pos_advice[1]}\n")
-    lines.append("**今日机会**（三池分开列，均无推荐时合并提示）")
+    lines.append("**今日机会**（四池分开列，均无推荐时合并提示）")
     if picks:
         if trend_all:
             names = "、".join(f"{p['名称']}({p['symbol']})" for p in trend_all[:4])
@@ -84,7 +86,7 @@ def generate_full_report(temp, details, pos_advice, boards, picks, rps_rows=None
         more = f" 等{len(warm_picks)}只" if len(warm_picks) > 4 else ""
         lines.append(f"- 🔥初动池（第3策略）{len(warm_picks)} 只候选：{names}{more}（详情见 03）")
     if not picks and not warm_picks:
-        lines.append("- 今日三池均无推荐/候选，观望为主")
+        lines.append("- 今日四池均无推荐/候选，观望为主")
     lines.append("")
 
     # —— 01 市场环境（温度/仓位已在速览，此处只放判定依据与维度明细）——

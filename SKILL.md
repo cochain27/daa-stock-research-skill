@@ -181,8 +181,7 @@ macOS 本机已用 WorkBuddy 自动化托管（无需 cron / 计划任务）：
 | `TREND_HOLD_DAYS` | 14-28天 | 趋势目标持仓 2-4 周 |
 | `TREND_EXTEND_MAX_DAYS` | 60天 | 趋势展期硬上限 |
 | `TREND_EXTEND_MAX_COUNT` | 2只 | 同时展期上限 |
-| `MAX_POSITION_PER_STOCK` | 30% | 单票最大仓位 |
-| `VIRTUAL_TRADE_AMOUNT` | 1万 | 每笔虚拟成交金额（等权记账） |
+| `VIRTUAL_TRADE_AMOUNT` | 1万 | 每笔虚拟成交金额（等权记账，决定单票=10%仓位） |
 | `SHORTLINE_ZT_MIN` | 50 | 短线开闸：涨停家数≥50 |
 | `SHORTLINE_ZB_RATE_MAX` | 40% | 短线开闸：炸板率<40% |
 | `BOTTOM_FISHING_TEMP_MAX` | 35 | 冰点抄底：温度≤35 才启用 |

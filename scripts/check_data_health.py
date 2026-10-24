@@ -66,6 +66,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--days", type=int, default=60, help="尾部窗口自然行数（默认60）")
     ap.add_argument("--json", default=None, help="把结果另存为 JSON")
+    ap.add_argument("--recent", type=int, default=5,
+                    help="近 N 个交易日缺口判 P0（默认5）")
     args = ap.parse_args()
 
     files = sorted(glob.glob(str(KLINE_DIR / "*.csv")))
@@ -102,15 +104,9 @@ def main():
     # ---------- 2. 交易日基准 = 覆盖 >90% 票的日期 ----------
     goal = sorted([d for d, c in day_cnt.items() if c > len(files) * 0.9])
 
-    # ---------- 3. 缺日 ----------
-    gaps = []
-    for sym, s in rows.items():
-        miss = [d for d in goal if d not in s]
-        if miss:
-            gaps.append({"代码": sym, "缺失数": len(miss), "缺失日": miss})
-
-    # ---------- 4. 假K线：零成交量 ----------
+    # ---------- 3. 假K线：零成交量（先算，供缺日分级用） ----------
     fake = []
+    halted = set()          # 近20日出现零量行 = 疑似停牌
     for sym in rows:
         df = load_kline(sym)
         if df is None:
@@ -118,6 +114,27 @@ def main():
         z = int((df["volume"].tail(20) == 0).sum())
         if z:
             fake.append({"代码": sym, "近20日零量行": z})
+            halted.add(sym)
+
+    # ---------- 4. 缺日 ----------
+    # 2026-10-23 分级修正：缺口≠全是 bug。停牌（上游本身无该日K线）与缓存漏抓
+    #   在本地文件上无法区分，但**后果完全不同**：
+    #     - 近期缺口（近 N 个交易日）：会直接污染当日信号/止损/T+5 判定 → P0
+    #     - 历史缺口（>N 日）：只影响长周期回测与 MA 计算，且多为停牌 → P1 提示
+    #   2026-10-23 二次修正：近期缺口若落在「近20日零量（停牌）」的票上，
+    #   本质是停牌无成交，不是漏抓 → 降 P1。否则 sh601198 这类长期停牌票
+    #   会永久红盘，掩护真正的新缺口。
+    recent_days = set(goal[-args.recent:]) if args.recent > 0 else set()
+    gaps, gaps_recent, gaps_old = [], [], []
+    for sym, s in rows.items():
+        miss = [d for d in goal if d not in s]
+        if not miss:
+            continue
+        rec = [] if sym in halted else [d for d in miss if d in recent_days]
+        item = {"代码": sym, "缺失数": len(miss), "缺失日": miss,
+                "近期缺失": rec, "停牌": sym in halted}
+        gaps.append(item)
+        (gaps_recent if rec else gaps_old).append(item)
 
     # ---------- 5. 台账/虚拟盘 取价校验 ----------
     led_issues = []
@@ -171,14 +188,20 @@ def main():
                          "建仓日": r["虚拟建仓日"]})
 
     # ---------- 输出 ----------
-    p0 = len(gaps) + len(led_issues) + len(dup) + len(badpx) + len(dups)
+    # P0 = 会让今日/本周统计口径直接失真的问题：近期缺日、台账取价越界/无K线、
+    #      重复日期、非正价、重复成交。
+    # P1 = 需人工判性质但不阻塞统计：历史缺日（多为停牌）、零量行（多为停牌）。
+    p0 = (len(gaps_recent) + len(led_issues) + len(dup) + len(badpx) + len(dups))
     print(f"== K线体检 ==  文件{len(files)}  基准交易日{len(goal)}"
           f"  ({goal[0] if goal else '-'} ~ {goal[-1] if goal else '-'})")
     print(f"  重复日期 {len(dup)}  乱序 {len(unsorted)}  非正价 {len(badpx)}")
-    print(f"  缺日票 {len(gaps)}")
-    for g in gaps[:20]:
-        print(f"    {g['代码']} 缺{g['缺失数']}日 {g['缺失日'][:5]}")
-    print(f"  近20日含零量行 {len(fake)} 只（停牌或假K线，需人工判性质）")
+    print(f"  近期缺日票 {len(gaps_recent)}（近{args.recent}交易日，P0）")
+    for g in gaps_recent[:20]:
+        print(f"    {g['代码']} 缺{g['缺失数']}日 近期缺{g['近期缺失']}")
+    print(f"  历史缺日票 {len(gaps_old)}（>近{args.recent}交易日，P1·多为停牌，不阻塞）")
+    for g in gaps_old[:20]:
+        print(f"    {g['代码']} 共缺{g['缺失数']}日 末缺{g['缺失日'][-1]}")
+    print(f"  近20日含零量行 {len(fake)} 只（P1·停牌或假K线，需人工判性质）")
     for x in fake[:10]:
         print(f"    {x['代码']} 零量{x['近20日零量行']}行")
     print(f"\n== 台账/虚拟盘体检 ==")
@@ -188,12 +211,13 @@ def main():
     print(f"  同代码同建仓日重复 {len(dups)} 条")
     for x in dups[:10]:
         print(f"    {x}")
-    print(f"\n== 结论 == {'P0 存在，先修再统计' if p0 else 'OK'}")
+    print(f"\n== 结论 == " + ("P0 存在，先修再统计" if p0 else "OK（无 P0）"))
 
     if args.json:
         Path(args.json).write_text(json.dumps({
             "files": len(files), "benchmark_days": goal,
-            "gaps": gaps, "fake_volume": fake, "ledger_issues": led_issues,
+            "gaps": gaps, "gaps_recent": gaps_recent, "gaps_old": gaps_old,
+            "fake_volume": fake, "ledger_issues": led_issues,
             "dup_dates": dup, "unsorted": unsorted, "bad_px": badpx,
             "dup_trades": dups, "p0": p0,
         }, ensure_ascii=False, indent=2), encoding="utf-8")

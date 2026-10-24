@@ -24,7 +24,7 @@ from config import (
 from tracker_common import (
     _read_rows, _write_rows, _vtrade_read, _vtrade_write,
     record_settlement, tech_break, extend_decision, virtual_nav_by_tag,
-    check_virtual_settled,
+    check_virtual_settled, trade_day_span, trade_days_held,
 )
 
 OPEN_STATUS = ("持有中", "止盈1减半", "展期中")  # "止盈1减半"保留以兼容历史台账，变体B不再新产生该状态
@@ -132,7 +132,8 @@ def update_track():
         r["最高收益%"] = str(round(hi, 2))
         r["最后更新"] = today
 
-        days = (datetime.strptime(today, "%Y-%m-%d") - datetime.strptime(r["日期"], "%Y-%m-%d")).days
+        # 2026-10-23：持有天数改交易日跨度，展期/T+28 评估不再被周末虚增
+        days = trade_days_held(r["日期"], today)
 
         # 技术面破坏检测（第2天起）：变体B = 破MA20结构止损 + 破MA10移动止盈（无盈利门槛）
         tech_broken, tech_reason = tech_break(r, price, mode="trend") if days >= 1 else (False, "")
@@ -205,7 +206,7 @@ def analyze_track_pool():
         except (ValueError, TypeError):
             continue
 
-        days = (datetime.strptime(r["最后更新"], "%Y-%m-%d") - datetime.strptime(r["日期"], "%Y-%m-%d")).days
+        days = trade_days_held(r["日期"], r["最后更新"])
 
         if q.get("最高", -1) == 0:
             analyzed.append({

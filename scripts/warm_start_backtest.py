@@ -38,6 +38,7 @@ BASE = Path(__file__).resolve().parent.parent / "data" / "klines"
 LB_LO, LB_HI = 1.3, 2.5          # 量比 1.3-2.5x
 CHG5_LO, CHG5_HI = 3.0, 8.0      # 5日涨幅 +3%~+8%
 POS60_MAX = 0.80                 # 位置 <80%
+POS60_MIN = 0.00                 # 位置下限（2026-10-23 归因后新增，--pos60min 覆盖）
 CHG_TODAY_MAX = 9.5              # 当日涨幅上限（未涨停）
 AMT_CAPS = {"≤16亿": 16e8, "≤50亿": 50e8, "不限": None}  # 成交额档位
 STOP_PCT = 0.92                  # 8% 止损
@@ -126,6 +127,7 @@ def _signal_mask(df):
         df["lb"].between(LB_LO, LB_HI)
         & df["chg5"].between(CHG5_LO, CHG5_HI)
         & (df["pos60"] < POS60_MAX)
+        & (df["pos60"] >= POS60_MIN)
         & (df["last"] > df["ma20"])
         & (df["dif"] > df["dea"])
         & (df["涨跌幅"] <= CHG_TODAY_MAX)
@@ -262,13 +264,15 @@ def _trade_result(df, i):
 
 def main():
     import sys
-    global ACTIVE_CONSOL, MODE_TWOSTAGE, WEEK_FILTER, PULLBACK_ENTRY
+    global ACTIVE_CONSOL, MODE_TWOSTAGE, WEEK_FILTER, PULLBACK_ENTRY, POS60_MIN
     args = sys.argv[1:]
     for a in args:
         if a.startswith("--consol="):
             v = a.split("=", 1)[1]
             if v in CONSOL_TIERS:
                 ACTIVE_CONSOL = v
+        if a.startswith("--pos60min="):
+            POS60_MIN = float(a.split("=", 1)[1])
         if a == "--twostage":
             MODE_TWOSTAGE = True
         if a == "--week":
@@ -280,6 +284,8 @@ def main():
         mode_desc += " +周线共振"
     if PULLBACK_ENTRY:
         mode_desc += " +回踩入场"
+    if POS60_MIN > 0:
+        mode_desc += f" +位置下限{POS60_MIN:.0%}"
     files = glob(str(BASE / "*.csv"))
     codes = sorted(Path(f).stem for f in files)
     print(f"扫描 {len(codes)} 只票，温和放量初动回测 [{mode_desc}] ...", flush=True)

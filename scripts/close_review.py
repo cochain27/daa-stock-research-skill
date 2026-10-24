@@ -23,6 +23,10 @@ BASE = Path(__file__).resolve().parent.parent
 WATCH_FIELDS = ["日期", "代码", "名称", "现价", "60日位置", "量比", "5日涨幅",
                 "行业", "买点区间", "止损价", "蓄势路径", "状态",
                 "已触发", "触发价"]   # 2026-09-30：触发后豁免 T+5 需跨日持久化「已触发」标记
+# 2026-10-23 新增「触发日」列（不在 WATCH_FIELDS 主表头里，仅落盘时补齐）：
+#   此前触发日靠 low_pos_tracker._fired_date_from_watch() 反推「最早 已触发=1 的行日期」，
+#   但写入时是写到该代码**最新一条** watch_history 行（= 入池日，不是触发日）→ 触发日系统性错位。
+WATCH_FIRED_DATE_FIELD = "触发日"
 
 INDUSTRY_HEAT_FILE = BASE / "data" / "industry_heat.csv"
 
@@ -497,6 +501,8 @@ def _track_watch_pool(today, lookback_days=10):
             trigger_line = round(first_price * (1 + _tg_line_pct), 2) if first_price else None
         except Exception:
             trigger_line = None
+        # 2026-10-23：首触发固化字段需在所有分支可见（首现分支不判定触发）
+        fired_price, fired_date, fired_new = None, None, False
         if last_hist_date == today_s and len(rows) == 1:
             status = f"🆕首现（{first_date}），观察中"
             status_tag = "🆕首现"
@@ -519,19 +525,31 @@ def _track_watch_pool(today, lookback_days=10):
                     trigger_hit = True
             except Exception:
                 pass
+            # ---- 2026-10-23 P0 修复：触发价/触发日「首触发固化」----
+            #   旧逻辑每日把 cur_price 写进 触发价 → 浮盈基准随行情漂移，
+            #   且触发日靠 watch 行日期反推（= 入池日，非触发日）→ 台账建仓日错位 3-4 天。
+            #   新口径：触发价 = 首次触发日收盘价（介入价），触发日 = 首次触发日；此后只读不写。
             if trigger_hit:
+                if _fired_before:
+                    try:
+                        fired_price = float(latest.get("触发价")) if latest.get("触发价") else None
+                    except (ValueError, TypeError):
+                        fired_price = None
+                    fired_date = (latest.get(WATCH_FIRED_DATE_FIELD)
+                                  or first_date)
+                    if fired_price is None:      # 存量脏数据兜底：退回首现价，不用今日现价
+                        fired_price = first_price
+                else:
+                    fired_price = cur_price      # 今天首次触发 → 今日收盘即介入价
+                    fired_date = today_s
+                    fired_new = True
                 # ---- 2026-09-30 用户拍板：触发后转「持仓跟踪」----
                 #   ① 豁免 T+5 时间止损（不再按入池期限移出，直到止盈/止损离场为止）
                 #   ② 给出具体止盈操作建议（+15% 减半 / +25% 清仓 / 破MA5 次日离场 / T+30 自动离场 / -8% 止损）
                 #   ③ 2026-10-20 用户拍板：触发即入第 3 台账（低位触发），计入虚拟净值与累计表现
                 _fired_codes.append(code)   # 落盘「已触发」持久化标记，跨日豁免生效
-                # 浮盈基准：优先触发价（首次触发日收盘/介入价），回退首现日收盘
-                _base = first_price
-                try:
-                    if latest.get("触发价"):
-                        _base = float(latest.get("触发价"))
-                except (ValueError, TypeError):
-                    pass
+                # 浮盈基准：触发价（首触发日收盘/介入价）；无则退回首现日收盘
+                _base = fired_price or first_price
                 _gain = (cur_price / _base - 1) * 100 if (cur_price and _base) else None
                 tp_acts = []
                 if _gain is not None and _gain >= _fired_tp_full * 100:
@@ -554,12 +572,14 @@ def _track_watch_pool(today, lookback_days=10):
                 status_tag = "🚀已触发跟踪"
                 action = "；".join(tp_acts)
                 # 2026-10-20：触发票入第 3 台账（低位触发）——「推荐即虚拟成交」
+                # 2026-10-23 修复：显式传 first_fired_date（首触发日），台账不再靠 watch 反推
                 try:
                     lowpos_register([{
                         "code": code, "name": name,
                         "cur_price": cur_price, "触发价": _base,
                         "buy_zone": buy_zone, "止损价": stop_loss,
                         "first_date": first_date,
+                        "first_fired_date": fired_date,
                     }], today=today_s)
                 except Exception as _e:
                     print(f"[低位触发台账] 入账失败 {code}: {_e}")
@@ -626,6 +646,10 @@ def _track_watch_pool(today, lookback_days=10):
             "action": action,
             "industry": latest.get("行业", ""),
             "fired": bool(trigger_hit),  # 2026-09-30：是否已触发（豁免 T+5 依据，落盘持久化）
+            # 2026-10-23：首触发固化字段（触发价为介入价，触发日为首次触达日）
+            "fired_price": fired_price,
+            "fired_date": fired_date,
+            "fired_new": fired_new,
         })
 
     # 2026-10-08 幽灵票修复：窗口外「观察中」票只参与 T+5 失效判定（_expired_codes 已收集），
@@ -647,10 +671,16 @@ def _track_watch_pool(today, lookback_days=10):
     _invalidate_codes = list(dict.fromkeys(_expired_codes + _stop_hit_codes))
     # 2026-09-30 新增：已触发票落盘「已触发」+「触发价」标记，使 T+5 豁免跨日生效。
     #   与「已失效」写盘合并为一次读写（避免同一文件多次改写）。
+    # 2026-10-23 P0 修复：触发价/触发日改「首触发固化」——只在**首次**触发时写，
+    #   已触发过的票绝不改写（旧逻辑每天用当日现价覆盖，浮盈基准随行情漂移）。
     _fired_map = {}
     for _r in results:
         if _r.get("fired"):
-            _fired_map[_r["code"]] = _r.get("cur_price")
+            _fired_map[_r["code"]] = {
+                "price": _r.get("fired_price") or _r.get("触发价") or _r.get("cur_price"),
+                "date": _r.get("fired_date") or _r.get("日期") or today_s,
+                "is_new": bool(_r.get("fired_new")),
+            }
     if _invalidate_codes or _fired_map:
         try:
             import shutil as _sh
@@ -661,8 +691,8 @@ def _track_watch_pool(today, lookback_days=10):
             with path.open(encoding="utf-8") as _f:
                 _rd = list(csv.DictReader(_f))
             fields = list(_rd[0].keys()) if _rd else WATCH_FIELDS
-            # 补齐新增字段（老文件无「已触发」/「触发价」列时）
-            for _fld in ("已触发", "触发价"):
+            # 补齐新增字段（老文件无「已触发」/「触发价」/「触发日」列时）
+            for _fld in ("已触发", "触发价", WATCH_FIRED_DATE_FIELD):
                 if _fld not in fields:
                     fields.append(_fld)
             # 只回写**该代码最新一条**记录的状态（避免历史"观察中"行覆盖失效标记，
@@ -678,12 +708,19 @@ def _track_watch_pool(today, lookback_days=10):
                 if _i is not None:
                     _rd[_i]["状态"] = "已失效"
             _nfired = 0
-            for _c, _p in _fired_map.items():
+            for _c, _fp in _fired_map.items():
                 _i = _latest_idx.get(_c)
                 if _i is not None and _c not in _exp:   # 已失效票不再标已触发
                     _rd[_i]["已触发"] = "1"
-                    if _p:
+                    # 首触发固化：仅当该行尚无有效触发价/触发日时才写入
+                    _p = _fp.get("price")
+                    if _p and not (_rd[_i].get("触发价") or "").strip():
                         _rd[_i]["触发价"] = _p
+                    elif _fp.get("is_new") and _p:
+                        _rd[_i]["触发价"] = _p
+                    _d = _fp.get("date")
+                    if _d and not (_rd[_i].get(WATCH_FIRED_DATE_FIELD) or "").strip():
+                        _rd[_i][WATCH_FIRED_DATE_FIELD] = _d
                     _nfired += 1
             with path.open("w", newline="", encoding="utf-8") as _f:
                 _w = csv.DictWriter(_f, fieldnames=fields, extrasaction="ignore")
@@ -1158,7 +1195,7 @@ def run_close():
         lines.append(f"\n## 低位启动观察\n\n- 筛选异常：{e}\n")
         print(f"[低位观察] 失败 {e}")
 
-    # ===== 三策略台账累计表现 + 三虚拟净值（置于推送末尾）=====
+    # ===== 四策略台账累计表现 + 四虚拟净值（置于推送末尾）=====
     # （2026-09-23 明日关注块已移入上方低位启动观察段，位于连续追踪之前）
     # 2026-09-30 用户拍板：撤掉「回测」列（短线3日回测结果不进推送，避免与研究口径
     #   混淆，也贴合「推送只留可执行信息」原则）；回测数据仍保留在 data/短线回测台账.csv，
@@ -1198,9 +1235,11 @@ def run_close():
     # 展示精简：统计类表格（累计入池/观察中/已移出）与入池口径注释不再进推送，
     # 口径信息完整保留在台账与 watch_pool_stats.py 周复盘脚本中。
     lines.append("\n## 策略体检（自动生成 + 每日复盘）\n")
-    # 2026-09-16 第3项落地：把空的"策略反思"升级为自动生成的三池体检 + 改进建议。
-    # 输入：今日温度/市场环境、三池触发事件（tracked 低位观察、track_rows 双池）、
-    #       台账累计胜率。输出：逐策略体检结论 + 明确的改进建议，供周复盘汇总。
+    # 2026-09-16 第3项落地：把空的"策略反思"升级为自动生成的策略体检 + 改进建议。
+    # 2026-10-23 扩为**四池**口径（趋势/短线/初动/低位触发），低位触发是本阶段唯一正收益池，
+    #   体检不带它就是漏掉最重要的那个信号。
+    # 输入：今日温度/市场环境、池触发事件（tracked 低位观察、track_rows 双池）、
+    #       四本台账累计胜率。输出：逐策略体检结论 + 明确的改进建议，供周复盘汇总。
     _sug = []
     _tag_t = trend_overview.get("总只数", 0)
     _tag_s = short_overview.get("总只数", 0)
@@ -1213,7 +1252,7 @@ def run_close():
         _sug.append(f"温度 {temp:.0f}/100（中性档），保持防守仓位，等待放量或情绪拐点再加仓。")
     else:
         _sug.append(f"温度 {temp:.0f}/100（弱势档），以观望/轻仓为主，短线开闸需等涨停家数回升。")
-    # ② 三池体检
+    # ② 四池体检
     _trig = []
     for t in (tracked or []):
         if t["status_tag"] == "🚀触发启动":
@@ -1225,7 +1264,7 @@ def run_close():
     _trig.extend(r.get("建议", "") for r in (track_rows or []) if "止盈" in str(r.get("建议", "")) or "止损" in str(r.get("建议", "")))
     _trig = [x for x in _trig if x]
     if _trig:
-        _sug.append("三池触发：" + "；".join(_trig[:5]) + (f"（共{len(_trig)}条）" if len(_trig) > 5 else "") + "。")
+        _sug.append("四池触发：" + "；".join(_trig[:5]) + (f"（共{len(_trig)}条）" if len(_trig) > 5 else "") + "。")
     # ③ 台账体检
     if _tag_t or _tag_s:
         _sug.append(f"台账现状：趋势累计{_tag_t}只/胜率{_win_t}，短线累计{_tag_s}只/胜率{_win_s}。"
@@ -1237,6 +1276,24 @@ def run_close():
         _trig_n = sum(1 for t in tracked if t["status_tag"] == "🚀触发启动")
         if _moved or _trig_n:
             _sug.append(f"低位观察池：今日 {_trig_n} 只触发启动 / {_moved} 只时间止损移出；触发率若不升，考虑收紧入池筛选（量比/成交额/位置）。")
+    # ⑤ 低位触发池体检（第 4 池，2026-10-23 新增）
+    #    该池「推荐即虚拟成交」，是四池里唯一可用真实净值衡量的池；
+    #    不带它的体检会让复盘看不到唯一正贡献来源（周报已因此修过一次）。
+    try:
+        _lst = lowpos_stats()
+        _lnav = (_lst.get("虚拟净值") or {})
+        if _lst.get("累计推荐"):
+            _sug.append(
+                f"低位触发池：累计 {_lst['累计推荐']} 只（持有 {_lst['持有中']}/已结清 {_lst['已结清']}，"
+                f"胜率 {_lst['胜率']}，平均峰值 {_lst['平均峰值']}）"
+                + (f"，净值 {_lnav['净值']:.0f}（{_lnav['累计收益率']:+.2f}%，"
+                   f"已实现 {_lnav['已实现盈亏']:+.0f}/浮动 {_lnav['浮动盈亏']:+.0f}）" if _lnav else "")
+                + "。"
+            )
+            if _lnav and _lnav.get("累计收益率", 0) > 0 and _lst.get("已结清", 0) < 10:
+                _sug.append("低位触发池样本仍少（<10 笔），正收益不构成规则有效性证据，继续积累再评估。")
+    except Exception as _e:
+        _sug.append(f"低位触发池统计失败：{_e}")
     for s in _sug:
         lines.append(f"- {s}")
     lines.append("- 做对的事：")
